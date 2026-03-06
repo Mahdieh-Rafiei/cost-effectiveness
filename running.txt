@@ -1,0 +1,5 @@
+Front Ent:
+streamlit run chatbot_ui.py --server.port 8501
+
+Backend:
+uvicorn app.main:app --reload --port 8000
