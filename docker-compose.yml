@@ -22,7 +22,7 @@ services:
     image: physaio-ce-ui
     container_name: physaio-ce-ui
     ports:
-      - "8154:8501"
+      - "8281:8501"
     environment:
       - API_BASE=http://physaio-ce-api:8000
     depends_on:
