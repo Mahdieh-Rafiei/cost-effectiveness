@@ -1,0 +1,30 @@
+version: '3'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.api
+    image: physaio-ce-api
+    container_name: physaio-ce-api
+    ports:
+      - "8153:8000"
+    volumes:
+      - ./backend/data:/app/data
+    env_file:
+      - .env
+    restart: always
+
+  ui:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.ui
+    image: physaio-ce-ui
+    container_name: physaio-ce-ui
+    ports:
+      - "8154:8501"
+    environment:
+      - API_BASE=http://physaio-ce-api:8000
+    depends_on:
+      - api
+    restart: always

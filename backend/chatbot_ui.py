@@ -3,11 +3,12 @@ Physiotherapy Cost-Effectiveness — Chat Interface
 Single-page conversational UI. No tabs. Just ask questions.
 """
 
+import os
 from typing import Optional
 import requests
 import streamlit as st
 
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000")
 
 # ── Page config ───────────────────────────────────────────────────────────────
 

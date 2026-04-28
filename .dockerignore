@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+backend/data/pdfs/
+backend/data/chroma/
+backend/data/*.sqlite3
+backend/data/*.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log

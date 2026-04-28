@@ -47,7 +47,8 @@ from .ce_build import build_ce_table
 from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
 
-ENV_PATH = "/Users/mahdie/Documents/1.PhysioAi/cost_effectiveness/.env"
+_default_env = Path(__file__).resolve().parent.parent.parent / ".env"
+ENV_PATH = os.getenv("ENV_PATH", str(_default_env) if _default_env.exists() else None)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 CHROMA_DIR = DATA_DIR / "chroma"
