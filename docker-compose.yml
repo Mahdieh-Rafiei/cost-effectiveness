@@ -21,6 +21,7 @@ services:
     container_name: physaio-ce-ui
     environment:
       - API_BASE=http://physaio-ce-api:8000
+      - STREAMLIT_SERVER_BASE_URL_PATH=/cost-effectiveness
     depends_on:
       - api
     restart: always
