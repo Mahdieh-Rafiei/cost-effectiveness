@@ -206,7 +206,7 @@ with st.sidebar:
     if selected_model != current_model:
         res = _post("/set_model", {"model": selected_model})
         if "error" not in res:
-            st.success(f"Switched to {selected_model}", icon="✓")
+            st.success(f"Switched to {selected_model}")
 
     if st.button("Refresh model list", use_container_width=True):
         st.session_state.model_list = _get("/list_models").get("models", [])
@@ -419,8 +419,5 @@ if user_q:
 
 if not st.session_state.messages:
     st.markdown("""
-<div class="info-box">
-    Start by asking a question above. Try: <em>"What does Figure 4 show and which interventions are dominant?"</em>
-    or <em>"Is there a difference between cost-effective and non-cost-effective interventions for knee?"</em>
-</div>
+
 """, unsafe_allow_html=True)
