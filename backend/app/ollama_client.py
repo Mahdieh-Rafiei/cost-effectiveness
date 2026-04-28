@@ -60,9 +60,10 @@ class OllamaClient:
 
         return out
 
-    def chat(self, messages: list, temperature: float = 0.2) -> str:
+    def chat(self, messages: list, temperature: float = 0.2,
+             model: Optional[str] = None) -> str:
         payload = {
-            "model": self.chat_model,
+            "model": model or self.chat_model,
             "messages": messages,
             "options": {"temperature": temperature},
             "stream": False,
@@ -80,3 +81,29 @@ class OllamaClient:
 
         j = r.json()
         return j["message"]["content"]
+
+    # Known embedding-only model name fragments to exclude from chat model list
+    _EMBED_KEYWORDS = (
+        "embed", "minilm", "bge", "e5-", "arctic-embed",
+        "snowflake", "gte-", "instructor",
+    )
+
+    def list_models(self) -> List[str]:
+        """Return chat-capable model names (embedding models excluded)."""
+        try:
+            r = requests.get(
+                f"{self.api_url}/api/tags",
+                headers=self.headers,
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+            models = data.get("models", [])
+            chat_models = [
+                m["name"] for m in models
+                if "name" in m
+                and not any(kw in m["name"].lower() for kw in self._EMBED_KEYWORDS)
+            ]
+            return sorted(chat_models)
+        except Exception:
+            return []

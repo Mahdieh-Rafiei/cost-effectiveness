@@ -1,5 +1,41 @@
-Front Ent:
-streamlit run chatbot_ui.py --server.port 8501
+── First-time setup ──────────────────────────────────────────────────────────
 
-Backend:
-uvicorn app.main:app --reload --port 8000
+1. Install deps (from project root):
+   pip install -r requirements.txt
+
+2. Index all PDFs + DOCX into Chroma (from backend/):
+   python ingest_all.py
+
+3. Start backend (from backend/):
+   uvicorn app.main:app --reload --port 8000
+
+4. Extract CE data from all papers (one-time, after backend is up):
+   curl -X POST http://127.0.0.1:8000/build_ce_table
+
+5. Start frontend (from backend/):
+   streamlit run chatbot_ui.py --server.port 8501
+
+
+── Daily use ─────────────────────────────────────────────────────────────────
+
+Backend:   uvicorn app.main:app --reload --port 8000
+Frontend:  streamlit run chatbot_ui.py --server.port 8501
+
+
+── API endpoints (key) ───────────────────────────────────────────────────────
+
+GET  /fig4                           → Fig 4 summary (physio vs non-physio)
+GET  /fig5                           → Fig 5 summary (physio vs physio)
+POST /body_region_analysis           → CE analysis for one body region
+POST /table2_by_region               → Table 2 dose characteristics by body region
+GET  /intervention_analysis          → dose vs CE outcome (optional filters)
+POST /compare_figures                → LLM: why do Fig 4 and Fig 5 differ?
+POST /explain_drivers                → LLM: what drives CE quadrant placement?
+GET  /validate_extraction/{paper_id} → Is Table 1 & 2 extraction correct?
+POST /review_fig5_placements         → LLM: agree with each Fig 5 placement?
+GET  /export_comparisons             → full dataset as JSON
+GET  /dataset_summary                → high-level counts
+POST /ask                            → single-paper RAG Q&A
+POST /ask_compare                    → cross-paper comparison
+
+Swagger UI: http://127.0.0.1:8000/docs

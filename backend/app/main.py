@@ -1,16 +1,50 @@
-from fastapi import FastAPI
+"""
+FastAPI backend for the Cost-Effectiveness Physiotherapy RAG system.
+
+Endpoints:
+  POST /ingest                  – index one PDF into Chroma
+  POST /ask                     – RAG Q&A on one or all papers
+  POST /ask_compare             – cross-paper comparison using ce_comparisons
+  POST /build_ce_table          – extract CE data for all PDFs → DB
+  GET  /list_papers             – list paper IDs in DB
+  GET  /status                  – vector-store chunk count
+  GET  /fig4                    – Fig 4 summary (physio vs non-physio)
+  GET  /fig5                    – Fig 5 summary (physio vs physio)
+  POST /body_region_analysis    – CE breakdown for one body region
+  GET  /intervention_analysis   – intervention-dose vs quadrant table
+  POST /compare_figures         – LLM explanation of Fig4 vs Fig5 differences
+  POST /explain_drivers         – why are some studies CE and others not?
+  GET  /export_comparisons      – all ce_comparisons rows as JSON
+  GET  /dataset_summary         – high-level counts
+
+  ── Next-step endpoints ──────────────────────────────────────────────────────
+  GET  /validate_extraction/{paper_id}
+       Are Tables 1 & 2 correctly extracted? Compares extracted DB fields
+       against the raw source evidence from the vector store.
+
+  POST /review_fig5_placements
+       Have a look at Fig 5 — do you agree with each comparison's quadrant?
+       Re-reads source evidence and asks LLM to agree/disagree with placement.
+
+  POST /table2_by_region
+       For a given body region, present Table-2-style intervention details
+       (type, frequency, sessions, session length, duration) and explain
+       whether CE vs non-CE interventions differ on those characteristics.
+"""
+
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Optional
-import re
+from typing import Optional, List, Dict, Any
 import json
+import os
 
 from .pdf_extract import extract_pdf_pages
 from .chunking import make_chunks
 from .vectorstore import VectorStore
 from .rag import answer_question
 from .ce_build import build_ce_table
-from .ce_db import query_sql
+from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
 
 ENV_PATH = "/Users/mahdie/Documents/1.PhysioAi/cost_effectiveness/.env"
@@ -18,58 +52,17 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 CHROMA_DIR = DATA_DIR / "chroma"
 
-app = FastAPI(title="Cost-Effectiveness Paper QA")
+app = FastAPI(title="Cost-Effectiveness Physiotherapy RAG")
 store = VectorStore(persist_dir=str(CHROMA_DIR), env_path=ENV_PATH, collection_name="papers")
 
-
-# -----------------------------
-# Utilities
-# -----------------------------
-def detect_condition(question: str):
-    q = question.lower()
-
-    # map user terms to broad groups used in extracted table
-    if "knee" in q or "hip" in q or "ankle" in q or "foot" in q:
-        return "lower limb"
-    if "shoulder" in q or "elbow" in q or "wrist" in q or "hand" in q:
-        return "upper limb"
-    if "spine" in q or "back" in q or "neck" in q:
-        return "spine"
-    if "upper limb" in q:
-        return "upper limb"
-    if "lower limb" in q:
-        return "lower limb"
-    return None
+# ── Global model state (changed at runtime via /set_model) ────────────────────
+from dotenv import load_dotenv
+load_dotenv(ENV_PATH)
+_chat_model: str = os.getenv("OLLAMA_CHAT_MODEL", "qwen3.5:9b")
 
 
-def normalize_condition_for_matching(raw: str) -> str:
-    """Normalize condition text for fuzzy matching."""
-    x = (raw or "").strip().lower()
-    x = re.sub(r"\s+", " ", x)
-    x = x.replace("-", " ")
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
-    # map common variants to broad categories
-    if any(k in x for k in ["knee", "hip", "ankle", "foot", "lower limb", "lower extrem", "patell", "acl"]):
-        return "lower limb"
-    if any(k in x for k in ["shoulder", "elbow", "wrist", "hand", "upper limb", "upper extrem"]):
-        return "upper limb"
-    if any(k in x for k in ["spine", "back", "neck", "lumbar", "cervical"]):
-        return "spine"
-    return x if x else "unknown"
-
-
-def top_counts(rows, key, top_n=5):
-    counts = {}
-    for r in rows:
-        v = str(r.get(key) or "unknown").strip().lower()
-        v = re.sub(r"\s+", " ", v)
-        counts[v] = counts.get(v, 0) + 1
-    return sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:top_n]
-
-
-# -----------------------------
-# API Models
-# -----------------------------
 class IngestRequest(BaseModel):
     pdf_path: str
 
@@ -80,11 +73,76 @@ class AskRequest(BaseModel):
 
 class CompareRequest(BaseModel):
     question: str
+    body_region: Optional[str] = None  # filter to specific region if given
+
+class BodyRegionRequest(BaseModel):
+    body_region: str   # e.g. "knee", "shoulder", "low_back"
+
+class DriverRequest(BaseModel):
+    body_region: Optional[str] = None
+
+class SetModelRequest(BaseModel):
+    model: str
 
 
-# -----------------------------
-# Core endpoints
-# -----------------------------
+# ── Utility helpers ───────────────────────────────────────────────────────────
+
+def _detect_condition(question: str) -> Optional[str]:
+    q = question.lower()
+    mapping = {
+        "knee": "knee", "patell": "knee", "acl": "knee",
+        "hip": "hip", "trochant": "hip",
+        "shoulder": "shoulder", "rotator": "shoulder", "subacromial": "shoulder",
+        "low back": "low_back", "lumbar": "low_back", "lbp": "low_back",
+        "back": "low_back",
+        "neck": "neck", "cervical": "neck",
+        "ankle": "ankle", "achilles": "ankle",
+        "elbow": "elbow", "epicondyl": "elbow",
+        "wrist": "wrist",
+    }
+    for kw, region in mapping.items():
+        if kw in q:
+            return region
+    return None
+
+
+def _top_counts(rows: List[dict], key: str, top_n: int = 8) -> List[Dict[str, Any]]:
+    counts: Dict[str, int] = {}
+    for r in rows:
+        v = str(r.get(key) or "unknown").strip().lower()
+        counts[v] = counts.get(v, 0) + 1
+    sorted_counts = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:top_n]
+    return [{"value": k, "count": v} for k, v in sorted_counts]
+
+
+def _llm_narrative(messages: list, temperature: float = 0.1) -> str:
+    llm = OllamaClient(env_path=ENV_PATH)
+    return llm.chat(messages, temperature=temperature, model=_chat_model)
+
+
+# ── Model management endpoints ────────────────────────────────────────────────
+
+@app.get("/list_models")
+def list_models():
+    llm = OllamaClient(env_path=ENV_PATH)
+    models = llm.list_models()
+    return {"models": models, "current": _chat_model}
+
+
+@app.get("/current_model")
+def current_model():
+    return {"model": _chat_model}
+
+
+@app.post("/set_model")
+def set_model(req: SetModelRequest):
+    global _chat_model
+    _chat_model = req.model.strip()
+    return {"model": _chat_model, "status": "ok"}
+
+
+# ── Core endpoints ────────────────────────────────────────────────────────────
+
 @app.post("/ingest")
 def ingest(req: IngestRequest):
     pages = extract_pdf_pages(req.pdf_path)
@@ -94,148 +152,1075 @@ def ingest(req: IngestRequest):
         "status": "ok",
         "paper_id": Path(req.pdf_path).stem,
         "pages": len(pages),
-        "chunks": len(chunks)
+        "chunks": len(chunks),
     }
+
 
 @app.post("/ask")
 def ask(req: AskRequest):
-    out = answer_question(
+    return answer_question(
         req.question,
         store=store,
         env_path=ENV_PATH,
         k=req.top_k,
-        paper_id=req.paper_id,  # pass filter through
+        paper_id=req.paper_id,
+        chat_model=_chat_model,
     )
-    return out
+
 
 @app.get("/status")
 def status():
-    n = store.col.count()
-    return {"chunks_indexed": n}
+    return {"chunks_indexed": store.col.count()}
+
 
 @app.post("/build_ce_table")
 def build_ce():
+    init_db()
     out = build_ce_table(store=store, env_path=ENV_PATH, pdf_dir=str(PDF_DIR))
     return out
 
+
 @app.get("/list_papers")
 def list_papers():
-    rows = query_sql("SELECT DISTINCT paper_id FROM ce_studies ORDER BY paper_id")
-    return {"papers": [r["paper_id"] for r in rows]}
-
-
-# -----------------------------
-# Cross-paper compare logic
-# -----------------------------
-def summarize_compare_question(question: str, env_path: str):
-    condition = detect_condition(question)
-
-    # Pull all rows first (safer), then filter in Python with normalization
-    rows = query_sql("""
-        SELECT paper_id, figure_group, condition, time_horizon, perspective, outcome_type,
-               comparator_type, quadrant, notes, evidence_pages
-        FROM ce_studies
-    """)
-
+    # Papers with CE extractions
+    rows = query_sql("SELECT DISTINCT paper_id FROM ce_comparisons ORDER BY paper_id")
     if not rows:
-        return {
-            "answer": "I could not find any extracted cross-paper records. Please run /build_ce_table first.",
-            "rows": []
-        }
+        rows = query_sql("SELECT DISTINCT paper_id FROM ce_studies ORDER BY paper_id")
+    db_ids = {r["paper_id"] for r in rows}
 
-    # Add normalized condition to each row for matching
+    # All papers indexed in the vector store
+    try:
+        all_meta = store.col.get(include=["metadatas"])["metadatas"]
+        vs_ids = {m["paper_id"] for m in all_meta if m.get("paper_id")}
+    except Exception:
+        vs_ids = set()
+
+    combined = sorted(db_ids | vs_ids)
+    return {"papers": combined}
+
+
+@app.get("/export_comparisons")
+def export_comparisons():
+    rows = query_sql("SELECT * FROM ce_comparisons ORDER BY paper_id, comparison_id")
+    return {"total": len(rows), "comparisons": rows}
+
+
+# ── Figure 4 & 5 endpoints ────────────────────────────────────────────────────
+
+def _fig_summary(figure_group: str) -> Dict[str, Any]:
+    """
+    Produce the data that replicates Fig 4 or Fig 5 from the review paper.
+
+    Fig 4 = physiotherapy vs non-physiotherapy (usual care, surgery, injection…)
+    Fig 5 = physiotherapy vs another physiotherapy modality
+    """
+    rows = query_sql(
+        "SELECT * FROM ce_comparisons WHERE figure_group = ?",
+        (figure_group,)
+    )
+
+    quadrant_map: Dict[str, List[dict]] = {
+        "dominant": [], "NE": [], "SW": [], "dominated": [], "unclear": []
+    }
     for r in rows:
-        r["_condition_norm"] = normalize_condition_for_matching(str(r.get("condition", "")))
+        q = r.get("quadrant", "unclear")
+        quadrant_map.setdefault(q, []).append(r)
 
-    filtered_rows = rows
-    if condition:
-        filtered_rows = [r for r in rows if r["_condition_norm"] == condition]
+    def _summary_list(lst: List[dict]) -> List[dict]:
+        return [
+            {
+                "paper_id": r["paper_id"],
+                "comparison_id": r["comparison_id"],
+                "body_region": r.get("body_region"),
+                "condition": r.get("condition"),
+                "intervention_type": r.get("intervention_type"),
+                "comparator_type": r.get("comparator_type"),
+                "time_horizon": r.get("time_horizon"),
+                "perspective": r.get("perspective"),
+                "ce_conclusion": r.get("ce_conclusion"),
+                "icer": r.get("icer"),
+                "notes": r.get("notes"),
+            }
+            for r in lst
+        ]
 
-        # fallback: if no exact normalized match, use all rows (and explain limitation)
-        if not filtered_rows:
-            filtered_rows = rows
-            condition_fallback_note = (
-                f"I could not find rows explicitly labeled as '{condition}', "
-                f"so I used all extracted studies instead."
-            )
-        else:
-            condition_fallback_note = None
-    else:
-        condition_fallback_note = None
-
-    # Split groups
-    ce_rows = []
-    less_rows = []
-    for r in filtered_rows:
-        q = str(r.get("quadrant", "")).strip().lower()
-        if q in {"dominant", "ne"}:
-            ce_rows.append(r)
-        else:
-            less_rows.append(r)
-
-    # Build structured summary for LLM
-    summary_payload = {
-        "question": question,
-        "condition_filter_requested": condition or "all",
-        "condition_fallback_note": condition_fallback_note,
-        "n_total_filtered": len(filtered_rows),
-        "n_cost_effective": len(ce_rows),
-        "n_less_cost_effective": len(less_rows),
-        "cost_effective_top_conditions": top_counts(ce_rows, "_condition_norm"),
-        "less_cost_effective_top_conditions": top_counts(less_rows, "_condition_norm"),
-        "cost_effective_top_intervention_types": top_counts(ce_rows, "comparator_type"),
-        "less_cost_effective_top_intervention_types": top_counts(less_rows, "comparator_type"),
-        "cost_effective_top_perspectives": top_counts(ce_rows, "perspective"),
-        "less_cost_effective_top_perspectives": top_counts(less_rows, "perspective"),
-        "cost_effective_top_horizons": top_counts(ce_rows, "time_horizon"),
-        "less_cost_effective_top_horizons": top_counts(less_rows, "time_horizon"),
-        "cost_effective_top_outcomes": top_counts(ce_rows, "outcome_type"),
-        "less_cost_effective_top_outcomes": top_counts(less_rows, "outcome_type"),
-        "example_cost_effective_notes": [r["notes"] for r in ce_rows[:8] if r.get("notes")],
-        "example_less_cost_effective_notes": [r["notes"] for r in less_rows[:8] if r.get("notes")],
-        "example_cost_effective_papers": [r["paper_id"] for r in ce_rows[:8]],
-        "example_less_cost_effective_papers": [r["paper_id"] for r in less_rows[:8]],
+    return {
+        "figure_group": figure_group,
+        "total_comparisons": len(rows),
+        "quadrant_counts": {k: len(v) for k, v in quadrant_map.items()},
+        "by_quadrant": {k: _summary_list(v) for k, v in quadrant_map.items()},
+        "by_body_region": _top_counts(rows, "body_region"),
+        "by_intervention_type": _top_counts(rows, "intervention_type"),
+        "by_comparator_type": _top_counts(rows, "comparator_type"),
+        "by_perspective": _top_counts(rows, "perspective"),
+        "by_time_horizon": _top_counts(rows, "time_horizon"),
     }
 
-    # If user asks simple count questions, we can still use LLM for narrative but include exact counts
-    llm = OllamaClient(env_path=env_path)
+
+@app.get("/fig4")
+def fig4_summary():
+    return _fig_summary("Fig4")
+
+
+@app.get("/fig5")
+def fig5_summary():
+    return _fig_summary("Fig5")
+
+
+# ── Body-region analysis ──────────────────────────────────────────────────────
+
+@app.post("/body_region_analysis")
+def body_region_analysis(req: BodyRegionRequest):
+    region = req.body_region.lower().strip()
+    rows = query_sql(
+        "SELECT * FROM ce_comparisons WHERE body_region = ?", (region,)
+    )
+    if not rows:
+        return {
+            "body_region": region,
+            "message": "No comparisons found for this body region.",
+            "available_regions": [
+                r["body_region"]
+                for r in query_sql(
+                    "SELECT DISTINCT body_region FROM ce_comparisons ORDER BY body_region"
+                )
+            ],
+        }
+
+    ce_rows = [r for r in rows if r.get("ce_conclusion") == "cost_effective"]
+    not_ce_rows = [r for r in rows if r.get("ce_conclusion") == "not_cost_effective"]
+    unclear_rows = [r for r in rows if r.get("ce_conclusion") == "inconclusive"]
+
+    # LLM explanation
+    payload = {
+        "body_region": region,
+        "total": len(rows),
+        "cost_effective": len(ce_rows),
+        "not_cost_effective": len(not_ce_rows),
+        "inconclusive": len(unclear_rows),
+        "ce_intervention_types": _top_counts(ce_rows, "intervention_type"),
+        "not_ce_intervention_types": _top_counts(not_ce_rows, "intervention_type"),
+        "ce_time_horizons": _top_counts(ce_rows, "time_horizon"),
+        "not_ce_time_horizons": _top_counts(not_ce_rows, "time_horizon"),
+        "ce_perspectives": _top_counts(ce_rows, "perspective"),
+        "ce_comparator_types": _top_counts(ce_rows, "comparator_type"),
+        "not_ce_comparator_types": _top_counts(not_ce_rows, "comparator_type"),
+        "ce_frequency": _top_counts(ce_rows, "frequency"),
+        "not_ce_frequency": _top_counts(not_ce_rows, "frequency"),
+        "ce_duration_weeks": _top_counts(ce_rows, "duration_weeks"),
+        "not_ce_duration_weeks": _top_counts(not_ce_rows, "duration_weeks"),
+        "ce_session_length": _top_counts(ce_rows, "session_length"),
+        "ce_total_sessions": _top_counts(ce_rows, "total_sessions"),
+        "not_ce_total_sessions": _top_counts(not_ce_rows, "total_sessions"),
+        "example_ce_notes": [r["notes"] for r in ce_rows[:6] if r.get("notes")],
+        "example_not_ce_notes": [r["notes"] for r in not_ce_rows[:6] if r.get("notes")],
+    }
+
     messages = [
         {
             "role": "system",
             "content": (
-                "You are an evidence-grounded research assistant. "
-                "Answer directly and naturally. "
-                "Do NOT start with phrases like 'According to the excerpts' or 'Based on the provided excerpts'. "
-                "Use ONLY the structured summary provided. "
-                "Write a concise narrative answer (not JSON). "
-                "If the data quality is limited, explicitly say so. "
-                "If a condition filter had no exact match, mention the fallback note if present. "
-                "Do not invent data."
+                "You are a health economics expert. "
+                "Analyse the structured data provided and write a concise, evidence-grounded "
+                "narrative explaining cost-effectiveness patterns for the given body region. "
+                "Focus on: which interventions are cost-effective, which are not, "
+                "and what study characteristics (type, dose, time horizon, comparator, perspective) "
+                "appear to drive the difference. "
+                "Do NOT invent data not present. "
+                "Write 3-5 paragraphs. No markdown headers."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Question: {question}\n\n"
-                f"Structured summary (JSON):\n{json.dumps(summary_payload, ensure_ascii=False, indent=2)}"
+                f"Body region: {region}\n\n"
+                f"Structured data (JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
             ),
         },
     ]
-    answer = llm.chat(messages, temperature=0.1)
-
-    # Remove internal helper key from debug rows
-    debug_rows = []
-    for r in filtered_rows:
-        rr = dict(r)
-        rr.pop("_condition_norm", None)
-        debug_rows.append(rr)
+    narrative = _llm_narrative(messages)
 
     return {
-        "answer": answer,
-        "rows": debug_rows  # UI can choose to hide/show
+        "body_region": region,
+        "total_comparisons": len(rows),
+        "cost_effective": len(ce_rows),
+        "not_cost_effective": len(not_ce_rows),
+        "inconclusive": len(unclear_rows),
+        "quadrant_counts": _top_counts(rows, "quadrant"),
+        "intervention_breakdown": {
+            "cost_effective": _top_counts(ce_rows, "intervention_type"),
+            "not_cost_effective": _top_counts(not_ce_rows, "intervention_type"),
+        },
+        "dose_breakdown": {
+            "frequency_ce": _top_counts(ce_rows, "frequency"),
+            "duration_weeks_ce": _top_counts(ce_rows, "duration_weeks"),
+            "total_sessions_ce": _top_counts(ce_rows, "total_sessions"),
+            "session_length_ce": _top_counts(ce_rows, "session_length"),
+        },
+        "narrative": narrative,
+        "comparisons": rows,
     }
+
+
+# ── Intervention analysis ─────────────────────────────────────────────────────
+
+@app.get("/intervention_analysis")
+def intervention_analysis(
+    body_region: Optional[str] = Query(None),
+    intervention_type: Optional[str] = Query(None),
+):
+    """
+    Dose-response style analysis: how do intervention characteristics
+    (frequency, duration, total sessions, session length) relate to quadrant placement?
+    Optionally filter by body_region and/or intervention_type.
+    """
+    sql = "SELECT * FROM ce_comparisons WHERE 1=1"
+    params: list = []
+    if body_region:
+        sql += " AND body_region = ?"
+        params.append(body_region)
+    if intervention_type:
+        sql += " AND intervention_type = ?"
+        params.append(intervention_type)
+
+    rows = query_sql(sql, tuple(params))
+    if not rows:
+        return {"message": "No rows match these filters.", "rows": []}
+
+    ce_rows = [r for r in rows if r.get("ce_conclusion") == "cost_effective"]
+    not_ce_rows = [r for r in rows if r.get("ce_conclusion") == "not_cost_effective"]
+
+    return {
+        "filter": {"body_region": body_region, "intervention_type": intervention_type},
+        "total": len(rows),
+        "cost_effective": len(ce_rows),
+        "not_cost_effective": len(not_ce_rows),
+        "characteristics": {
+            "frequency": {
+                "cost_effective": _top_counts(ce_rows, "frequency"),
+                "not_cost_effective": _top_counts(not_ce_rows, "frequency"),
+            },
+            "duration_weeks": {
+                "cost_effective": _top_counts(ce_rows, "duration_weeks"),
+                "not_cost_effective": _top_counts(not_ce_rows, "duration_weeks"),
+            },
+            "total_sessions": {
+                "cost_effective": _top_counts(ce_rows, "total_sessions"),
+                "not_cost_effective": _top_counts(not_ce_rows, "total_sessions"),
+            },
+            "session_length": {
+                "cost_effective": _top_counts(ce_rows, "session_length"),
+                "not_cost_effective": _top_counts(not_ce_rows, "session_length"),
+            },
+            "supervision": {
+                "cost_effective": _top_counts(ce_rows, "supervision"),
+                "not_cost_effective": _top_counts(not_ce_rows, "supervision"),
+            },
+            "time_horizon": {
+                "cost_effective": _top_counts(ce_rows, "time_horizon"),
+                "not_cost_effective": _top_counts(not_ce_rows, "time_horizon"),
+            },
+        },
+        "rows": rows,
+    }
+
+
+# ── Compare figures ───────────────────────────────────────────────────────────
+
+@app.post("/compare_figures")
+def compare_figures():
+    """
+    LLM explanation of why Fig 4 and Fig 5 differ.
+    Now also callable via /ask_compare when user asks about the figures in Chat.
+    """
+    fig4 = _fig_summary("Fig4")
+    fig5 = _fig_summary("Fig5")
+
+    if fig4["total_comparisons"] == 0 and fig5["total_comparisons"] == 0:
+        return {
+            "explanation": (
+                "No data found in ce_comparisons. "
+                "Please run /build_ce_table first to extract CE data from the papers."
+            ),
+            "fig4_summary": fig4,
+            "fig5_summary": fig5,
+        }
+
+    payload = {
+        "fig4": {
+            "description": "Physiotherapy vs non-physiotherapy (usual care, surgery, injection, medical care)",
+            "total": fig4["total_comparisons"],
+            "quadrant_counts": fig4["quadrant_counts"],
+            "top_body_regions": fig4["by_body_region"][:5],
+            "top_interventions": fig4["by_intervention_type"][:5],
+            "top_comparators": fig4["by_comparator_type"][:5],
+        },
+        "fig5": {
+            "description": "Physiotherapy vs physiotherapy (different modalities compared head-to-head)",
+            "total": fig5["total_comparisons"],
+            "quadrant_counts": fig5["quadrant_counts"],
+            "top_body_regions": fig5["by_body_region"][:5],
+            "top_interventions": fig5["by_intervention_type"][:5],
+            "top_comparators": fig5["by_comparator_type"][:5],
+        },
+    }
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a health economics expert specialising in musculoskeletal physiotherapy. "
+                "Use the structured summary to explain the differences between Figure 4 and Figure 5 "
+                "in the context of a systematic review of cost-effectiveness studies. "
+                "Address: (1) what each figure represents conceptually, "
+                "(2) why the quadrant distributions differ, "
+                "(3) clinical and methodological reasons for the differences, "
+                "(4) what these patterns mean for practice. "
+                "Write 4-6 paragraphs. Be specific about the data. Do NOT invent data."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Explain the differences between Figure 4 and Figure 5.\n\n"
+                f"Data (JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            ),
+        },
+    ]
+
+    narrative = _llm_narrative(messages, temperature=0.15)
+    return {
+        "fig4_summary": fig4,
+        "fig5_summary": fig5,
+        "explanation": narrative,
+    }
+
+
+# ── Quadrant-driver explanation ───────────────────────────────────────────────
+
+@app.post("/explain_drivers")
+def explain_drivers(req: DriverRequest):
+    """
+    Explain which study characteristics drive cost-effectiveness quadrant placement.
+    Optionally filter to one body region.
+    """
+    sql = "SELECT * FROM ce_comparisons WHERE 1=1"
+    params: list = []
+    if req.body_region:
+        sql += " AND body_region = ?"
+        params.append(req.body_region)
+
+    rows = query_sql(sql, tuple(params))
+    if not rows:
+        return {"message": "No data found for the requested filter."}
+
+    ce_rows = [r for r in rows if r.get("ce_conclusion") == "cost_effective"]
+    not_ce_rows = [r for r in rows if r.get("ce_conclusion") == "not_cost_effective"]
+
+    payload = {
+        "scope": req.body_region or "all body regions",
+        "total_comparisons": len(rows),
+        "cost_effective": len(ce_rows),
+        "not_cost_effective": len(not_ce_rows),
+        "driver_data": {
+            "time_horizon": {
+                "ce": _top_counts(ce_rows, "time_horizon"),
+                "not_ce": _top_counts(not_ce_rows, "time_horizon"),
+            },
+            "condition": {
+                "ce": _top_counts(ce_rows, "condition"),
+                "not_ce": _top_counts(not_ce_rows, "condition"),
+            },
+            "intervention_type": {
+                "ce": _top_counts(ce_rows, "intervention_type"),
+                "not_ce": _top_counts(not_ce_rows, "intervention_type"),
+            },
+            "comparator_type": {
+                "ce": _top_counts(ce_rows, "comparator_type"),
+                "not_ce": _top_counts(not_ce_rows, "comparator_type"),
+            },
+            "perspective": {
+                "ce": _top_counts(ce_rows, "perspective"),
+                "not_ce": _top_counts(not_ce_rows, "perspective"),
+            },
+            "outcome_type": {
+                "ce": _top_counts(ce_rows, "outcome_type"),
+                "not_ce": _top_counts(not_ce_rows, "outcome_type"),
+            },
+            "duration_weeks": {
+                "ce": _top_counts(ce_rows, "duration_weeks"),
+                "not_ce": _top_counts(not_ce_rows, "duration_weeks"),
+            },
+            "frequency": {
+                "ce": _top_counts(ce_rows, "frequency"),
+                "not_ce": _top_counts(not_ce_rows, "frequency"),
+            },
+            "body_region": {
+                "ce": _top_counts(ce_rows, "body_region"),
+                "not_ce": _top_counts(not_ce_rows, "body_region"),
+            },
+        },
+        "ce_example_notes": [r["notes"] for r in ce_rows[:8] if r.get("notes")],
+        "not_ce_example_notes": [r["notes"] for r in not_ce_rows[:8] if r.get("notes")],
+    }
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a health economics expert. "
+                "Analyse the structured data and identify which study characteristics "
+                "drive whether a physiotherapy intervention is cost-effective or not. "
+                "Synthesise patterns across: time horizon, intervention type, dose (frequency/duration), "
+                "condition, comparator type, perspective, and outcome type. "
+                "Give specific, evidence-grounded statements like: "
+                "'Exercise programs with longer time horizons (≥12 months) appear more often in the dominant quadrant.' "
+                "Write 4-6 paragraphs. No markdown headers. Be specific."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Scope: {req.body_region or 'all body regions'}\n\n"
+                f"Data (JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            ),
+        },
+    ]
+
+    narrative = _llm_narrative(messages, temperature=0.1)
+    return {
+        "scope": req.body_region or "all",
+        "total_comparisons": len(rows),
+        "cost_effective": len(ce_rows),
+        "not_cost_effective": len(not_ce_rows),
+        "driver_summary": payload["driver_data"],
+        "narrative": narrative,
+    }
+
+
+# ── Cross-paper comparison (ask_compare) ─────────────────────────────────────
+# One unified entry point for all cross-paper questions.
+# Intent detection injects the right data automatically so the user just types
+# naturally in Chat without navigating any menus.
+
+def _q(s: str) -> str:
+    return s.lower()
+
+def _has(q: str, *keywords) -> bool:
+    return any(k in q for k in keywords)
+
+
+def _detect_intents(question: str, region: Optional[str]) -> Dict[str, bool]:
+    q = _q(question)
+    return {
+        # Figure questions
+        "fig4": _has(q, "fig 4", "fig4", "figure 4", "physio vs non",
+                     "versus usual care", "versus surgery", "versus injection"),
+        "fig5": _has(q, "fig 5", "fig5", "figure 5", "physio vs physio",
+                     "head-to-head", "versus another physio"),
+        "both_figs": _has(q, "compare figure", "difference between fig",
+                          "fig 4 and fig 5", "both figure", "figure 4 and figure 5"),
+        # Extraction validation
+        "validate_extraction": _has(q, "correctly extracted", "extraction correct",
+                                    "table 1", "table 2", "are these correct",
+                                    "is it correct", "correctly identified",
+                                    "check the extraction", "verify extraction",
+                                    "did you extract", "is the content"),
+        # Fig 5 placement review
+        "review_placement": _has(q, "agree with", "do you agree", "placement",
+                                 "location of", "correctly placed", "correct quadrant",
+                                 "should it be") and _has(q, "fig 5", "fig5", "figure 5",
+                                                          "comparison", "quadrant"),
+        # Body-region CE difference
+        "region_ce_diff": region is not None and _has(q, "difference", "differ",
+                           "cost-effective", "cost effective", "is there",
+                           "why", "which", "what", "compare"),
+        # Table 2 / intervention characteristics by region
+        "table2_region": region is not None and _has(q, "frequency", "sessions",
+                         "duration", "length", "session length", "per week",
+                         "how often", "how long", "type of", "table 2",
+                         "dose", "intensity", "supervision", "intervention"),
+    }
+
+
+def _table2_summary(ce_rows: List[dict], not_ce_rows: List[dict]) -> Dict[str, Any]:
+    """Build Table-2-style characteristic comparison."""
+    return {
+        "intervention_type":          {"ce": _top_counts(ce_rows, "intervention_type"),
+                                       "not_ce": _top_counts(not_ce_rows, "intervention_type")},
+        "frequency_per_week":         {"ce": _top_counts(ce_rows, "frequency"),
+                                       "not_ce": _top_counts(not_ce_rows, "frequency")},
+        "total_sessions":             {"ce": _top_counts(ce_rows, "total_sessions"),
+                                       "not_ce": _top_counts(not_ce_rows, "total_sessions")},
+        "session_length":             {"ce": _top_counts(ce_rows, "session_length"),
+                                       "not_ce": _top_counts(not_ce_rows, "session_length")},
+        "duration_weeks":             {"ce": _top_counts(ce_rows, "duration_weeks"),
+                                       "not_ce": _top_counts(not_ce_rows, "duration_weeks")},
+        "supervision":                {"ce": _top_counts(ce_rows, "supervision"),
+                                       "not_ce": _top_counts(not_ce_rows, "supervision")},
+        "time_horizon":               {"ce": _top_counts(ce_rows, "time_horizon"),
+                                       "not_ce": _top_counts(not_ce_rows, "time_horizon")},
+        "comparator_type":            {"ce": _top_counts(ce_rows, "comparator_type"),
+                                       "not_ce": _top_counts(not_ce_rows, "comparator_type")},
+        "ce_example_details":   [r.get("intervention_detail","") for r in ce_rows[:5]],
+        "not_ce_example_details":[r.get("intervention_detail","") for r in not_ce_rows[:5]],
+    }
+
+
+def _summarize_compare_question(question: str, body_region: Optional[str] = None) -> Dict[str, Any]:
+    region = body_region or _detect_condition(question)
+    intents = _detect_intents(question, region)
+
+    # ── Load all CE comparisons ──────────────────────────────────────────────
+    all_rows = query_sql("SELECT * FROM ce_comparisons")
+    if not all_rows:
+        all_rows = query_sql("""
+            SELECT paper_id, figure_group, condition AS body_region,
+                   time_horizon, perspective, outcome_type, comparator_type,
+                   quadrant, notes, evidence_pages,
+                   NULL AS intervention_type, NULL AS duration_weeks,
+                   NULL AS frequency, NULL AS ce_conclusion,
+                   NULL AS intervention_detail, NULL AS total_sessions,
+                   NULL AS session_length, NULL AS supervision
+            FROM ce_studies
+        """)
+
+    if not all_rows:
+        return {
+            "answer": "No extracted data found. Please run /build_ce_table first to extract data from the papers.",
+            "rows": [],
+        }
+
+    # Filter to body region if specified
+    region_rows = all_rows
+    if region:
+        region_rows = [r for r in all_rows if str(r.get("body_region","")).lower() == region]
+        if not region_rows:
+            region_rows = all_rows  # fallback
+
+    ce_rows     = [r for r in region_rows if str(r.get("ce_conclusion","")).startswith("cost_eff")
+                   or str(r.get("quadrant","")).lower() == "dominant"]
+    not_ce_rows = [r for r in region_rows if str(r.get("ce_conclusion","")) == "not_cost_effective"
+                   or str(r.get("quadrant","")).lower() == "dominated"]
+
+    # ── Base payload ─────────────────────────────────────────────────────────
+    payload: Dict[str, Any] = {
+        "question": question,
+        "scope": region or "all body regions",
+        "total_comparisons": len(region_rows),
+        "cost_effective_n": len(ce_rows),
+        "not_cost_effective_n": len(not_ce_rows),
+        "overall_ce_by_intervention":  _top_counts(ce_rows,     "intervention_type"),
+        "overall_nce_by_intervention": _top_counts(not_ce_rows, "intervention_type"),
+        "overall_ce_by_comparator":    _top_counts(ce_rows,     "comparator_type"),
+        "overall_nce_by_comparator":   _top_counts(not_ce_rows, "comparator_type"),
+        "overall_ce_by_horizon":       _top_counts(ce_rows,     "time_horizon"),
+        "overall_nce_by_horizon":      _top_counts(not_ce_rows, "time_horizon"),
+        "overall_ce_by_perspective":   _top_counts(ce_rows,     "perspective"),
+        "ce_notes_examples":   [r.get("notes","") for r in ce_rows[:5]    if r.get("notes")],
+        "nce_notes_examples":  [r.get("notes","") for r in not_ce_rows[:5] if r.get("notes")],
+    }
+
+    # ── Inject data per detected intent ──────────────────────────────────────
+
+    # Fig 4
+    if intents["fig4"] or intents["both_figs"]:
+        f4 = _fig_summary("Fig4")
+        payload["fig4"] = {
+            "what_it_is": "Physiotherapy vs NON-physiotherapy comparator (usual care, surgery, injection, GP, wait-list). Each data point = one intervention-comparator pair from a study.",
+            "total_comparisons": f4["total_comparisons"],
+            "quadrant_counts": f4["quadrant_counts"],
+            "top_body_regions": f4["by_body_region"][:6],
+            "top_interventions": f4["by_intervention_type"][:6],
+            "top_comparators": f4["by_comparator_type"][:6],
+            "dominant_examples": f4["by_quadrant"].get("dominant", [])[:4],
+            "dominated_examples": f4["by_quadrant"].get("dominated", [])[:4],
+            "NE_examples": f4["by_quadrant"].get("NE", [])[:4],
+        }
+
+    # Fig 5
+    if intents["fig5"] or intents["both_figs"] or intents["review_placement"]:
+        f5 = _fig_summary("Fig5")
+        payload["fig5"] = {
+            "what_it_is": "Physiotherapy vs ANOTHER physiotherapy modality (e.g. exercise vs manual therapy, head-to-head). Each data point = one comparison from a study.",
+            "total_comparisons": f5["total_comparisons"],
+            "quadrant_counts": f5["quadrant_counts"],
+            "top_body_regions": f5["by_body_region"][:6],
+            "top_interventions": f5["by_intervention_type"][:6],
+            "top_comparators": f5["by_comparator_type"][:6],
+            "all_comparisons_with_quadrant": [
+                {
+                    "paper_id": r["paper_id"],
+                    "body_region": r.get("body_region"),
+                    "intervention": r.get("intervention_type"),
+                    "vs": r.get("comparator_type"),
+                    "quadrant": r.get("quadrant"),
+                    "delta_cost": r.get("delta_cost_direction"),
+                    "delta_effect": r.get("delta_effect_direction"),
+                    "icer": r.get("icer"),
+                    "notes": r.get("notes","")[:150],
+                }
+                for comp_list in f5["by_quadrant"].values()
+                for r in comp_list
+            ],
+        }
+
+    # Table 1 & 2 extraction quality
+    if intents["validate_extraction"]:
+        sample = all_rows[:10]
+        payload["extraction_quality_check"] = {
+            "what_this_is": "Sample of extracted Table 1 & Table 2 fields from the papers",
+            "total_papers_extracted": len({r["paper_id"] for r in all_rows}),
+            "total_comparisons_extracted": len(all_rows),
+            "fields_available": ["body_region","condition","country","setting",
+                                  "sample_size","study_design","time_horizon",
+                                  "perspective","outcome_type","outcome_measure",
+                                  "intervention_type","frequency","total_sessions",
+                                  "session_length","duration_weeks","supervision",
+                                  "comparator_type","quadrant","icer","ce_conclusion"],
+            "unknown_rate_by_field": {
+                field: round(sum(1 for r in all_rows if str(r.get(field,"")) in ("unknown","","None")) / max(len(all_rows),1), 2)
+                for field in ["body_region","time_horizon","perspective","outcome_type",
+                              "intervention_type","frequency","total_sessions",
+                              "session_length","duration_weeks","comparator_type","quadrant"]
+            },
+            "sample_rows": [
+                {k: r.get(k) for k in ["paper_id","body_region","condition","time_horizon",
+                                         "perspective","outcome_type","intervention_type",
+                                         "frequency","total_sessions","session_length",
+                                         "duration_weeks","comparator_type","quadrant",
+                                         "ce_conclusion","extraction_confidence"]}
+                for r in sample
+            ],
+        }
+
+    # Body-region CE difference
+    if intents["region_ce_diff"] and region:
+        payload["region_ce_analysis"] = {
+            "body_region": region,
+            "total": len(region_rows),
+            "cost_effective_n": len(ce_rows),
+            "not_cost_effective_n": len(not_ce_rows),
+            "ce_interventions":  _top_counts(ce_rows,     "intervention_type"),
+            "nce_interventions": _top_counts(not_ce_rows, "intervention_type"),
+            "ce_comparators":    _top_counts(ce_rows,     "comparator_type"),
+            "nce_comparators":   _top_counts(not_ce_rows, "comparator_type"),
+            "ce_horizons":       _top_counts(ce_rows,     "time_horizon"),
+            "nce_horizons":      _top_counts(not_ce_rows, "time_horizon"),
+            "ce_perspectives":   _top_counts(ce_rows,     "perspective"),
+        }
+
+    # Table 2 intervention characteristics by region
+    if intents["table2_region"] and region:
+        payload["table2_intervention_characteristics"] = {
+            "body_region": region,
+            "interpretation": "Compare cost_effective vs not_cost_effective groups on each characteristic",
+            **_table2_summary(ce_rows, not_ce_rows),
+        }
+
+    # ── System prompt ─────────────────────────────────────────────────────────
+    system_prompt = """You are a health economics expert who has analysed a systematic review of physiotherapy cost-effectiveness studies.
+You have structured data extracted from all included papers in the JSON below.
+Answer the user's question directly, specifically, and naturally — as if explaining to a colleague.
+
+Guidelines:
+- For Fig 4/5 questions: explain what the figure represents, report quadrant counts, identify patterns, explain why placements differ.
+- For extraction quality questions: report the unknown/missing rates per field, comment on which fields are reliably vs. poorly captured.
+- For Fig 5 placement review: go through the comparisons, comment on whether each quadrant assignment makes sense given cost/effect directions.
+- For body-region CE questions: state clearly which interventions are cost-effective vs not, and why (comparator, horizon, perspective, dose).
+- For Table 2 / intervention characteristics: identify which characteristics (frequency, duration, sessions, session length, type) differ between cost-effective and not-cost-effective groups.
+- Be specific with numbers. Do NOT say 'based on the data'. Do NOT invent facts."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": (
+            f"Question: {question}\n\n"
+            f"Data:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        )},
+    ]
+
+    answer = _llm_narrative(messages)
+    return {"answer": answer, "rows": region_rows, "structured_summary": payload}
 
 
 @app.post("/ask_compare")
 def ask_compare(req: CompareRequest):
-    return summarize_compare_question(req.question, env_path=ENV_PATH)
+    return _summarize_compare_question(req.question, body_region=req.body_region)
+
+
+# ── Dataset-level summary ─────────────────────────────────────────────────────
+
+@app.get("/dataset_summary")
+def dataset_summary():
+    return get_comparisons_summary()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEXT-STEP ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 1. Validate Table 1 & 2 extraction for one paper ─────────────────────────
+
+@app.get("/validate_extraction/{paper_id}")
+def validate_extraction(paper_id: str):
+    """
+    Next-step Q: "Is the content of Tables 1 and 2 correctly extracted?"
+
+    Re-reads the source evidence from the vector store and asks the LLM to
+    compare it against what was stored in ce_comparisons. Returns a structured
+    verdict (agree / partially agree / disagree) per field group.
+    """
+    # Pull extracted rows from DB
+    rows = query_sql(
+        "SELECT * FROM ce_comparisons WHERE paper_id = ?", (paper_id,)
+    )
+    if not rows:
+        return {
+            "paper_id": paper_id,
+            "error": "No extracted data found for this paper. Run /build_ce_table first.",
+        }
+
+    # Re-query vector store for raw source evidence
+    from .ce_build import _gather_context
+    context = _gather_context(store, paper_id)
+    if not context.strip():
+        return {
+            "paper_id": paper_id,
+            "error": "No source chunks found in vector store for this paper.",
+        }
+
+    # Build field snapshot to validate (Table 1 + Table 2 fields only)
+    first = rows[0]
+    table1_fields = {k: first.get(k) for k in [
+        "body_region", "condition", "country", "setting",
+        "sample_size", "study_design", "time_horizon",
+        "perspective", "outcome_type", "outcome_measure",
+    ]}
+    all_comparisons_table2 = [
+        {
+            "comparison_id": r["comparison_id"],
+            "intervention_type": r.get("intervention_type"),
+            "intervention_detail": r.get("intervention_detail"),
+            "frequency": r.get("frequency"),
+            "total_sessions": r.get("total_sessions"),
+            "session_length": r.get("session_length"),
+            "duration_weeks": r.get("duration_weeks"),
+            "supervision": r.get("supervision"),
+            "comparator_type": r.get("comparator_type"),
+            "comparator_detail": r.get("comparator_detail"),
+            "figure_group": r.get("figure_group"),
+            "quadrant": r.get("quadrant"),
+            "ce_conclusion": r.get("ce_conclusion"),
+            "icer": r.get("icer"),
+            "notes": r.get("notes"),
+        }
+        for r in rows
+    ]
+
+    validation_payload = {
+        "paper_id": paper_id,
+        "extracted_table1": table1_fields,
+        "extracted_comparisons_table2": all_comparisons_table2,
+        "n_comparisons": len(rows),
+    }
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a health economics expert performing a quality check on automatically "
+                "extracted data from a cost-effectiveness paper. "
+                "Compare the extracted fields against the source evidence excerpts. "
+                "For each field group, state: CORRECT / PARTIALLY CORRECT / INCORRECT / CANNOT VERIFY. "
+                "Be specific: quote the source when correcting a value. "
+                "Structure your answer as:\n"
+                "TABLE 1 FIELDS (study characteristics):\n"
+                "- [field]: [verdict] — [reason or corrected value]\n\n"
+                "TABLE 2 FIELDS (intervention details per comparison):\n"
+                "- [field]: [verdict] — [reason or corrected value]\n\n"
+                "OVERALL VERDICT: [high confidence / medium confidence / low confidence in extraction]\n"
+                "SUGGESTED CORRECTIONS: [list any fields that should be changed]"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Paper: {paper_id}\n\n"
+                f"Extracted data:\n{json.dumps(validation_payload, ensure_ascii=False, indent=2)}\n\n"
+                f"Source evidence from the paper:\n{context}"
+            ),
+        },
+    ]
+
+    verdict = _llm_narrative(messages, temperature=0.0)
+
+    return {
+        "paper_id": paper_id,
+        "n_comparisons": len(rows),
+        "extracted_table1": table1_fields,
+        "extracted_comparisons": all_comparisons_table2,
+        "llm_verdict": verdict,
+        "source_evidence_chars": len(context),
+    }
+
+
+# ── 2. Review Fig 5 placements ────────────────────────────────────────────────
+
+class ReviewFig5Request(BaseModel):
+    paper_id: Optional[str] = None   # review one paper; None = review all Fig 5 papers
+
+
+@app.post("/review_fig5_placements")
+def review_fig5_placements(req: ReviewFig5Request):
+    """
+    Next-step Q: "Have a look at Figure 5 — do you agree with the location of each comparison?"
+
+    For each Fig 5 comparison (physio vs physio), re-reads source evidence and
+    asks the LLM whether the quadrant assignment is justified.
+    Returns a per-comparison verdict: AGREE / UNCERTAIN / DISAGREE + reason.
+    """
+    sql = "SELECT * FROM ce_comparisons WHERE figure_group = 'Fig5'"
+    params: tuple = ()
+    if req.paper_id:
+        sql += " AND paper_id = ?"
+        params = (req.paper_id,)
+
+    rows = query_sql(sql, params)
+    if not rows:
+        return {"message": "No Fig 5 comparisons found.", "reviews": []}
+
+    from .ce_build import _gather_context
+
+    reviews = []
+    for row in rows:
+        pid = row["paper_id"]
+        cid = row["comparison_id"]
+
+        context = _gather_context(store, pid)
+
+        comp_summary = {
+            "intervention_type": row.get("intervention_type"),
+            "intervention_detail": row.get("intervention_detail"),
+            "comparator_type": row.get("comparator_type"),
+            "comparator_detail": row.get("comparator_detail"),
+            "body_region": row.get("body_region"),
+            "condition": row.get("condition"),
+            "time_horizon": row.get("time_horizon"),
+            "perspective": row.get("perspective"),
+            "delta_cost_direction": row.get("delta_cost_direction"),
+            "delta_effect_direction": row.get("delta_effect_direction"),
+            "icer": row.get("icer"),
+            "quadrant": row.get("quadrant"),
+            "ce_conclusion": row.get("ce_conclusion"),
+            "extracted_notes": row.get("notes"),
+        }
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a health economics expert reviewing the quadrant placement "
+                    "of a physiotherapy comparison on the cost-effectiveness plane. "
+                    "Quadrant definitions:\n"
+                    "  dominant = intervention LESS costly AND MORE effective\n"
+                    "  dominated = intervention MORE costly AND LESS effective\n"
+                    "  NE = MORE costly AND MORE effective (trade-off)\n"
+                    "  SW = LESS costly AND LESS effective (trade-off)\n"
+                    "  unclear = insufficient evidence for classification\n\n"
+                    "Based on the source evidence, state:\n"
+                    "VERDICT: AGREE / UNCERTAIN / DISAGREE\n"
+                    "REASON: (1-3 sentences citing specific evidence)\n"
+                    "CORRECT QUADRANT (if DISAGREE): dominant | dominated | NE | SW | unclear\n"
+                    "Be concise and specific."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Paper: {pid} | Comparison: {cid}\n"
+                    f"Assigned quadrant: {row.get('quadrant')}\n\n"
+                    f"Extracted comparison data:\n{json.dumps(comp_summary, ensure_ascii=False, indent=2)}\n\n"
+                    f"Source evidence:\n{context[:8000]}"
+                ),
+            },
+        ]
+
+        verdict_text = _llm_narrative(messages, temperature=0.0)
+
+        # Parse simple verdict line
+        verdict_tag = "UNCERTAIN"
+        for line in verdict_text.splitlines():
+            line_u = line.strip().upper()
+            if line_u.startswith("VERDICT:"):
+                tag = line_u.replace("VERDICT:", "").strip()
+                if "AGREE" in tag and "DIS" not in tag:
+                    verdict_tag = "AGREE"
+                elif "DISAGREE" in tag:
+                    verdict_tag = "DISAGREE"
+                break
+
+        reviews.append({
+            "paper_id": pid,
+            "comparison_id": cid,
+            "assigned_quadrant": row.get("quadrant"),
+            "body_region": row.get("body_region"),
+            "intervention_type": row.get("intervention_type"),
+            "comparator_type": row.get("comparator_type"),
+            "verdict": verdict_tag,
+            "llm_review": verdict_text,
+        })
+
+    n_agree = sum(1 for r in reviews if r["verdict"] == "AGREE")
+    n_disagree = sum(1 for r in reviews if r["verdict"] == "DISAGREE")
+    n_uncertain = sum(1 for r in reviews if r["verdict"] == "UNCERTAIN")
+
+    return {
+        "fig5_comparisons_reviewed": len(reviews),
+        "agree": n_agree,
+        "disagree": n_disagree,
+        "uncertain": n_uncertain,
+        "reviews": reviews,
+    }
+
+
+# ── 3. Table 2 characteristics by body region ─────────────────────────────────
+
+class Table2RegionRequest(BaseModel):
+    body_region: str   # e.g. "knee", "shoulder", "hip", "low_back"
+
+
+@app.post("/table2_by_region")
+def table2_by_region(req: Table2RegionRequest):
+    """
+    Next-step Q: "In the length/type/frequency/duration of the intervention
+    for knee/hip/shoulder (separately) — is there a difference between
+    cost-effective and non-cost-effective interventions?"
+
+    Returns a Table-2-style breakdown of all intervention characteristics
+    for the given body region, split by CE outcome, plus an LLM narrative
+    identifying the key differentiators.
+    """
+    region = req.body_region.lower().strip()
+    rows = query_sql(
+        "SELECT * FROM ce_comparisons WHERE body_region = ?", (region,)
+    )
+    if not rows:
+        available = [
+            r["body_region"]
+            for r in query_sql(
+                "SELECT DISTINCT body_region FROM ce_comparisons ORDER BY body_region"
+            )
+        ]
+        return {
+            "body_region": region,
+            "error": f"No data for '{region}'.",
+            "available_regions": available,
+        }
+
+    ce_rows = [r for r in rows if r.get("ce_conclusion") == "cost_effective"]
+    not_ce_rows = [r for r in rows if r.get("ce_conclusion") == "not_cost_effective"]
+    unclear_rows = [r for r in rows if r.get("ce_conclusion") == "inconclusive"]
+
+    def _table2_rows(lst: List[dict]) -> List[dict]:
+        return [
+            {
+                "paper_id": r["paper_id"],
+                "intervention_type": r.get("intervention_type"),
+                "intervention_detail": r.get("intervention_detail"),
+                "frequency": r.get("frequency"),
+                "total_sessions": r.get("total_sessions"),
+                "session_length": r.get("session_length"),
+                "duration_weeks": r.get("duration_weeks"),
+                "supervision": r.get("supervision"),
+                "comparator_type": r.get("comparator_type"),
+                "time_horizon": r.get("time_horizon"),
+                "quadrant": r.get("quadrant"),
+                "icer": r.get("icer"),
+                "notes": r.get("notes"),
+            }
+            for r in lst
+        ]
+
+    table2_ce = _table2_rows(ce_rows)
+    table2_not_ce = _table2_rows(not_ce_rows)
+
+    # Statistical summaries for the LLM
+    payload = {
+        "body_region": region,
+        "total_comparisons": len(rows),
+        "cost_effective_n": len(ce_rows),
+        "not_cost_effective_n": len(not_ce_rows),
+        "inconclusive_n": len(unclear_rows),
+        "intervention_type": {
+            "cost_effective": _top_counts(ce_rows, "intervention_type"),
+            "not_cost_effective": _top_counts(not_ce_rows, "intervention_type"),
+        },
+        "frequency_sessions_per_week": {
+            "cost_effective": _top_counts(ce_rows, "frequency"),
+            "not_cost_effective": _top_counts(not_ce_rows, "frequency"),
+        },
+        "total_sessions": {
+            "cost_effective": _top_counts(ce_rows, "total_sessions"),
+            "not_cost_effective": _top_counts(not_ce_rows, "total_sessions"),
+        },
+        "session_length": {
+            "cost_effective": _top_counts(ce_rows, "session_length"),
+            "not_cost_effective": _top_counts(not_ce_rows, "session_length"),
+        },
+        "duration_weeks": {
+            "cost_effective": _top_counts(ce_rows, "duration_weeks"),
+            "not_cost_effective": _top_counts(not_ce_rows, "duration_weeks"),
+        },
+        "supervision": {
+            "cost_effective": _top_counts(ce_rows, "supervision"),
+            "not_cost_effective": _top_counts(not_ce_rows, "supervision"),
+        },
+        "time_horizon": {
+            "cost_effective": _top_counts(ce_rows, "time_horizon"),
+            "not_cost_effective": _top_counts(not_ce_rows, "time_horizon"),
+        },
+        "comparator_type": {
+            "cost_effective": _top_counts(ce_rows, "comparator_type"),
+            "not_cost_effective": _top_counts(not_ce_rows, "comparator_type"),
+        },
+        "ce_example_notes": [r.get("notes", "") for r in ce_rows[:5]],
+        "not_ce_example_notes": [r.get("notes", "") for r in not_ce_rows[:5]],
+    }
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a health economics expert synthesising intervention characteristics "
+                "from a systematic review of physiotherapy cost-effectiveness studies. "
+                "Your task: for the given body region, identify which Table-2 characteristics "
+                "(intervention type, frequency, total sessions, session length, duration, supervision, "
+                "time horizon, comparator) differ between cost-effective and non-cost-effective interventions. "
+                "Use the data precisely. "
+                "Format your answer as numbered points, each covering one characteristic. "
+                "End with a 2-sentence overall conclusion."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Body region: {region}\n\n"
+                f"Table 2 summary data (JSON):\n"
+                f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            ),
+        },
+    ]
+
+    narrative = _llm_narrative(messages, temperature=0.05)
+
+    return {
+        "body_region": region,
+        "total_comparisons": len(rows),
+        "cost_effective_n": len(ce_rows),
+        "not_cost_effective_n": len(not_ce_rows),
+        "inconclusive_n": len(unclear_rows),
+        "table2_cost_effective": table2_ce,
+        "table2_not_cost_effective": table2_not_ce,
+        "characteristic_comparison": payload,
+        "llm_narrative": narrative,
+    }

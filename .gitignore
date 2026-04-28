@@ -2,8 +2,8 @@
 .xls/
 .xlsx/
 
-*.pdf/
-
+*.pdf
+*.docx
 
 # Virtual environments
 .venv/
@@ -51,6 +51,11 @@ data/chroma/
 data/*.sqlite
 data/*.sqlite3
 data/*.db
+backend/data/pdfs/
+backend/data/chroma/
+backend/data/*.sqlite
+backend/data/*.sqlite3
+backend/data/*.db
 
 # -----------------------------
 # Chroma / vector DB internals
