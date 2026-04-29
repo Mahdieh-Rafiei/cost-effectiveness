@@ -282,28 +282,44 @@ def answer_question(
             ]
             if images:
                 try:
-                    # Supplement with database data for this paper if count is asked
+                    # Supplement with database counts for counting questions
                     db_context = ""
                     _count_kw = {"how many", "count", "number of", "dominant",
                                  "dominated", "quadrant", "cost-effective", "icer"}
-                    if any(k in question.lower() for k in _count_kw) and paper_id:
+                    if any(k in question.lower() for k in _count_kw):
                         from .ce_db import query_sql
-                        rows = query_sql(
+
+                        # Per-paper counts
+                        paper_rows = query_sql(
                             "SELECT * FROM ce_comparisons WHERE paper_id = ?",
                             (paper_id,)
                         )
-                        if rows:
-                            quad_counts = {}
-                            for r in rows:
-                                q = r.get("quadrant", "unclear")
-                                quad_counts[q] = quad_counts.get(q, 0) + 1
-                            db_context = (
-                                f"\n\nExtracted data for this paper: "
-                                f"{len(rows)} comparison(s). "
-                                f"Quadrant counts: {quad_counts}. "
-                                f"CE conclusion: "
-                                f"{[r.get('ce_conclusion') for r in rows]}."
-                            )
+                        paper_quad = {}
+                        for r in paper_rows:
+                            q = r.get("quadrant", "unclear")
+                            paper_quad[q] = paper_quad.get(q, 0) + 1
+
+                        # Cross-paper aggregate (used when this paper is a review
+                        # and its figures show many individual study comparisons)
+                        all_rows = query_sql(
+                            "SELECT quadrant, ce_conclusion FROM ce_comparisons "
+                            "WHERE quadrant != 'unclear'", ()
+                        )
+                        all_quad = {}
+                        for r in all_rows:
+                            q = r.get("quadrant", "unclear")
+                            all_quad[q] = all_quad.get(q, 0) + 1
+
+                        db_context = (
+                            f"\n\n--- DATABASE COUNTS (use these for exact numbers) ---"
+                            f"\nThis paper's extracted comparisons: {len(paper_rows)}, "
+                            f"quadrant breakdown: {paper_quad}."
+                            f"\nAcross ALL 78 papers in the database "
+                            f"(excluding unclear): {all_quad}. "
+                            f"Total classified: {sum(all_quad.values())}."
+                            f"\nIf the figure shows data from multiple studies, "
+                            f"use the cross-paper counts above as the authoritative answer."
+                        )
                     answer = llm.vision_chat(
                         question=question,
                         images_b64=images,
