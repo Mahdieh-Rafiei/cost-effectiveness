@@ -4,6 +4,7 @@ Single-page conversational UI. No tabs. Just ask questions.
 """
 
 import os
+import re
 from typing import Optional
 import requests
 import streamlit as st
@@ -382,6 +383,21 @@ if user_q:
 
     # paper_id to use for the request
     active_paper_id = st.session_state.selected_paper or None
+
+    # If the question explicitly references a figure and no paper is selected,
+    # ask the user to specify rather than guessing wrong.
+    _has_fig_ref = bool(re.search(r'\bfig(?:ure)?\b', q_lower))
+    if _has_fig_ref and not active_paper_id and mode != "Cross-paper":
+        clarify = (
+            "I can describe figures with full visual analysis, but I need to know "
+            "which paper you're referring to — each paper has its own Figure 4, "
+            "Figure 5, etc.\n\n"
+            "Please **select a paper from the sidebar** and ask again."
+        )
+        with st.chat_message("assistant"):
+            st.markdown(clarify)
+        st.session_state.messages.append({"role": "assistant", "content": clarify})
+        st.stop()
 
     if mode == "Cross-paper":
         use_compare = True
