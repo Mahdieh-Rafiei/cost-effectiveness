@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from dotenv import load_dotenv
 from typing import Optional, List
@@ -62,7 +63,7 @@ class OllamaClient:
 
     def chat(self, messages: list, temperature: float = 0.2,
              model: Optional[str] = None, think: bool = False,
-             timeout: int = 180) -> str:
+             timeout: int = 180, max_retries: int = 4) -> str:
         payload = {
             "model": model or self.chat_model,
             "messages": messages,
@@ -71,18 +72,34 @@ class OllamaClient:
             "stream": False,
         }
 
-        r = requests.post(
-            f"{self.api_url}/api/chat",
-            headers=self.headers,
-            json=payload,
-            timeout=timeout,
-        )
-
-        if r.status_code >= 400:
-            raise RuntimeError(f"Chat error {r.status_code}: {r.text}")
-
-        j = r.json()
-        return j["message"]["content"]
+        for attempt in range(max_retries):
+            wait = 20 * (attempt + 1)
+            try:
+                r = requests.post(
+                    f"{self.api_url}/api/chat",
+                    headers=self.headers,
+                    json=payload,
+                    timeout=timeout,
+                )
+                if r.status_code == 503:
+                    print(f"    [retry {attempt+1}/{max_retries}] server busy, waiting {wait}s…")
+                    time.sleep(wait)
+                    continue
+                if r.status_code >= 400:
+                    raise RuntimeError(f"Chat error {r.status_code}: {r.text}")
+                if not r.text.strip():
+                    print(f"    [retry {attempt+1}/{max_retries}] empty response, waiting {wait}s…")
+                    time.sleep(wait)
+                    continue
+                j = r.json()
+                return j["message"]["content"]
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    print(f"    [retry {attempt+1}/{max_retries}] timeout, waiting {wait}s…")
+                    time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError(f"Chat failed after {max_retries} retries")
 
     # Known embedding-only model name fragments to exclude from chat model list
     _EMBED_KEYWORDS = (

@@ -8,6 +8,7 @@ Strategy per paper:
   4. Persist each row into ce_comparisons via upsert_comparison().
 """
 
+import time
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -134,6 +135,7 @@ def build_comparisons(store: VectorStore, env_path: str, pdf_dir: str) -> Dict[s
             n = len(comparisons)
             print(f"  ✓ {n} comparison(s) extracted")
             done += 1
+            time.sleep(5)  # avoid overwhelming the shared Ollama server
 
         except Exception as e:
             print(f"  ✗ ERROR: {e}")
