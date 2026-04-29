@@ -423,8 +423,9 @@ if user_q:
             )
             st.markdown(answer)
         else:
-            # Single-paper: stream tokens in real time
+            # Single-paper: show thinking indicator, then stream tokens
             placeholder = st.empty()
+            placeholder.markdown("_Thinking…_")
             answer = ""
             for chunk in _stream_ask({
                 "question": user_q,
