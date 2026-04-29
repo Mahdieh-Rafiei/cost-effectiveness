@@ -264,8 +264,9 @@ def answer_question(
 
     llm = OllamaClient(env_path=env_path)
 
-    # Vision augmentation: render PDF pages when asking about figures in a specific paper
-    if is_figure_question(question) and paper_id and pdf_dir:
+    # Vision augmentation: always use vision in single-paper mode so the model
+    # can answer from tables, figures, equations, and text — not just text chunks.
+    if paper_id and pdf_dir:
         pdf_path = Path(pdf_dir) / f"{paper_id}.pdf"
         if not pdf_path.exists():
             matches = sorted(Path(pdf_dir).glob(f"{paper_id}*.pdf"))
