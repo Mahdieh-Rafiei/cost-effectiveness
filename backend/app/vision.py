@@ -54,12 +54,14 @@ def find_figure_pages(pdf_path: str, figure_num: str) -> List[int]:
 
 
 def extract_figure_ref(question: str) -> Optional[str]:
-    """
-    Extract the figure NUMBER from the question.
-    e.g. 'What does Figure 4 show?' -> '4'
-    """
+    """Extract the FIRST figure number from the question."""
     m = re.search(r'\bfig(?:ure)?\.?\s*(\d+[a-z]?)\b', question, re.IGNORECASE)
     return m.group(1) if m else None
+
+
+def extract_all_figure_refs(question: str) -> List[str]:
+    """Extract ALL figure numbers from the question (for comparative questions)."""
+    return re.findall(r'\bfig(?:ure)?\.?\s*(\d+[a-z]?)\b', question, re.IGNORECASE)
 
 
 def is_figure_question(question: str) -> bool:
@@ -73,7 +75,7 @@ def get_pages_for_question(
     pdf_path: str,
     question: str,
     retrieved_pages: List[int],
-    max_pages: int = 4,
+    max_pages: int = 6,
 ) -> List[int]:
     """
     Return the best set of page numbers to render for a figure question.
@@ -81,10 +83,12 @@ def get_pages_for_question(
     """
     pages: List[int] = []
 
-    figure_num = extract_figure_ref(question)
-    if figure_num:
-        fig_pages = find_figure_pages(pdf_path, figure_num)
-        pages.extend(fig_pages)
+    # Extract all referenced figure numbers (handles "Fig 4 vs Fig 5" comparisons)
+    fig_nums = extract_all_figure_refs(question)
+    for fig_num in fig_nums:
+        for p in find_figure_pages(pdf_path, fig_num):
+            if p not in pages:
+                pages.append(p)
 
     # Add surrounding page for each figure page (caption often on next page)
     extra = []
