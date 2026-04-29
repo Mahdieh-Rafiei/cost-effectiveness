@@ -218,6 +218,58 @@ def extract_comparisons(
     return result
 
 
+QUADRANT_FOCUS_TEMPLATE = """Paper ID: {paper_id}
+
+A previous extraction could not determine the cost-effectiveness quadrant.
+Focus ONLY on: which quadrant does this intervention fall in?
+
+dominant = costs LESS AND is MORE effective
+dominated = costs MORE AND is LESS effective
+NE = costs MORE AND is MORE effective (may be CE if ICER < WTP threshold)
+SW = costs LESS AND is LESS effective
+
+Look specifically for:
+- Explicit words: "dominant", "dominated", "cost-effective", "cost saving"
+- Cost direction: "more costly", "less costly", "cost saving", "similar cost"
+- Effect direction: "more effective", "better outcome", "similar effect", "no difference"
+- Any ICER value (£/QALY, $/QALY, €/QALY)
+- WTP threshold comparison
+
+Return ONLY this JSON with no other text:
+{{
+  "delta_cost_direction": "<more_costly|less_costly|similar|unknown>",
+  "delta_effect_direction": "<more_effective|less_effective|similar|unknown>",
+  "icer": "<ICER value or unknown>",
+  "quadrant": "<dominant|dominated|NE|SW|unclear>",
+  "ce_conclusion": "<cost_effective|not_cost_effective|inconclusive>",
+  "notes": "<1-2 sentences citing the key evidence>",
+  "extraction_confidence": "<high|medium|low>"
+}}
+
+Evidence:
+{context}
+"""
+
+
+def extract_quadrant_focused(paper_id: str, context: str, env_path: str) -> Dict[str, Any]:
+    """Second-pass extraction focused only on quadrant determination for unclear papers."""
+    llm = OllamaClient(env_path=env_path)
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": QUADRANT_FOCUS_TEMPLATE.format(
+            paper_id=paper_id, context=context,
+        )},
+    ]
+    try:
+        raw = llm.chat(messages, temperature=0.0, think=False, timeout=300)
+        parsed = _extract_json_block(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
 def make_fallback_comparisons(paper_id: str, reason: str = "") -> List[Dict[str, Any]]:
     """Return a single placeholder comparison when extraction fails."""
     c = _sanitize_comparison({}, paper_id, 1)

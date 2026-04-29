@@ -273,6 +273,71 @@ with st.sidebar:
     top_k = st.slider("Chunks retrieved (RAG)", 4, 60, 12,
                       help="More chunks = more context, slower")
 
+    # ── Paper metadata card ───────────────────────────────────────────────────
+    if mode == "Single-paper" and st.session_state.get("selected_paper"):
+        pid = st.session_state.selected_paper
+        info = _get("/paper_info", params={"paper_id": pid})
+        if info.get("found"):
+            st.markdown("---")
+            st.markdown("**📋 Paper snapshot**")
+
+            _QUAD_ICON = {
+                "dominant":  "🟢 Dominant",
+                "dominated": "🔴 Dominated",
+                "NE":        "🟡 NE",
+                "SW":        "🔵 SW",
+                "unclear":   "⚪ Unclear",
+            }
+            quadrants = info.get("quadrants", [])
+            quad_display = (
+                _QUAD_ICON.get(quadrants[0], quadrants[0])
+                if len(set(quadrants)) == 1
+                else f"{len(quadrants)} comparisons"
+            )
+
+            meta_lines = []
+            if info.get("year") != "unknown":
+                meta_lines.append(f"**Year:** {info['year']}")
+            if info.get("body_region") != "unknown":
+                meta_lines.append(f"**Region:** {info['body_region'].replace('_',' ').title()}")
+            if info.get("intervention_type") != "unknown":
+                meta_lines.append(f"**Intervention:** {info['intervention_type'].replace('_',' ')}")
+            if info.get("comparator_type") != "unknown":
+                meta_lines.append(f"**vs:** {info['comparator_type'].replace('_',' ')}")
+            if info.get("time_horizon") != "unknown":
+                meta_lines.append(f"**Follow-up:** {info['time_horizon']}")
+            icer = info.get("icer", "unknown")
+            if icer and icer != "unknown":
+                meta_lines.append(f"**ICER:** {icer if isinstance(icer, str) else icer[0]}")
+            meta_lines.append(f"**Quadrant:** {quad_display}")
+
+            st.markdown("\n\n".join(meta_lines))
+
+            # ── Suggested questions ───────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("**💡 Suggested questions**")
+            region = info.get("body_region", "unknown").replace("_", " ")
+            interv = info.get("intervention_type", "unknown").replace("_", " ")
+            quad   = quadrants[0] if quadrants else "unclear"
+
+            suggestions = [
+                "What is the main cost-effectiveness finding of this study?",
+                f"How was the {interv} intervention delivered — frequency, sessions, duration?" if interv != "unknown" else "How was the intervention delivered?",
+            ]
+            if region != "unknown":
+                suggestions.append(f"What outcome measures were used for {region}?")
+            if quad == "dominant":
+                suggestions.append("Why was this intervention considered dominant (cost-saving and more effective)?")
+            elif quad == "NE":
+                suggestions.append("What willingness-to-pay threshold was used and is the ICER acceptable?")
+            elif quad == "dominated":
+                suggestions.append("Why was this intervention not cost-effective?")
+            else:
+                suggestions.append("What was the ICER value and is the intervention cost-effective?")
+
+            for sq in suggestions[:4]:
+                st.markdown(f'<div class="example-q">💬 {sq}</div>', unsafe_allow_html=True)
+
     st.markdown("---")
     st.caption("Physio CE Analyser · v2.0")
 

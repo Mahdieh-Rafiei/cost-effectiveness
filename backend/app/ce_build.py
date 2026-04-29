@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 from .vectorstore import VectorStore
-from .ce_extract import extract_comparisons, make_fallback_comparisons
-from .ce_db import init_db, upsert_comparison, upsert_row
+from .ce_extract import extract_comparisons, make_fallback_comparisons, extract_quadrant_focused
+from .ce_db import init_db, upsert_comparison, upsert_row, query_sql, get_conn
 
 # ── Targeted semantic queries ────────────────────────────────────────────────
 # Four specialised queries maximise recall of different evidence types.
@@ -152,6 +152,77 @@ def build_comparisons(store: VectorStore, env_path: str, pdf_dir: str) -> Dict[s
         "papers_processed": done,
         "papers_total": total,
         "errors": errors,
+    }
+
+
+# ── Second-pass rebuild for unclear papers ────────────────────────────────────
+
+def rebuild_unclear_papers(store: VectorStore, env_path: str) -> Dict[str, Any]:
+    """
+    Focused second-pass extraction for papers still marked unclear.
+    Uses a shorter, targeted prompt that zeroes in on cost/effect direction.
+    """
+    unclear_rows = query_sql(
+        "SELECT DISTINCT paper_id FROM ce_comparisons WHERE quadrant = 'unclear'", ()
+    )
+    paper_ids = [r["paper_id"] for r in unclear_rows]
+
+    if not paper_ids:
+        return {"status": "ok", "updated": 0, "still_unclear": 0,
+                "message": "No unclear papers found"}
+
+    updated = 0
+    still_unclear = 0
+
+    for paper_id in paper_ids:
+        print(f"[REBUILD] {paper_id}")
+        try:
+            context = _gather_context(store, paper_id)
+            if not context.strip():
+                print(f"  ⚠ No context found")
+                still_unclear += 1
+                continue
+
+            focused = extract_quadrant_focused(paper_id, context, env_path)
+            quadrant = focused.get("quadrant", "unclear")
+
+            if quadrant != "unclear":
+                conn = get_conn()
+                conn.execute("""
+                    UPDATE ce_comparisons
+                    SET quadrant=?, ce_conclusion=?, delta_cost_direction=?,
+                        delta_effect_direction=?, icer=?, notes=?,
+                        extraction_confidence=?
+                    WHERE paper_id=? AND quadrant='unclear'
+                """, (
+                    quadrant,
+                    focused.get("ce_conclusion", "inconclusive"),
+                    focused.get("delta_cost_direction", "unknown"),
+                    focused.get("delta_effect_direction", "unknown"),
+                    focused.get("icer", "unknown"),
+                    focused.get("notes", ""),
+                    focused.get("extraction_confidence", "low"),
+                    paper_id,
+                ))
+                conn.commit()
+                conn.close()
+                print(f"  ✓ Resolved to: {quadrant}")
+                updated += 1
+            else:
+                print(f"  ⚠ Still unclear")
+                still_unclear += 1
+
+            time.sleep(3)
+
+        except Exception as e:
+            print(f"  ✗ ERROR: {e}")
+            still_unclear += 1
+
+    return {
+        "status": "ok",
+        "papers_processed": len(paper_ids),
+        "updated": updated,
+        "still_unclear": still_unclear,
     }
 
 

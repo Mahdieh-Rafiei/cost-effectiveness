@@ -44,7 +44,7 @@ from .pdf_extract import extract_pdf_pages
 from .chunking import make_chunks
 from .vectorstore import VectorStore
 from .rag import answer_question, answer_question_stream
-from .ce_build import build_ce_table
+from .ce_build import build_ce_table, rebuild_unclear_papers
 from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
 from .vision import (is_figure_question, get_pages_for_question,
@@ -207,6 +207,47 @@ def build_ce():
     init_db()
     out = build_ce_table(store=store, env_path=ENV_PATH, pdf_dir=str(PDF_DIR))
     return out
+
+
+@app.post("/rebuild_unclear")
+def rebuild_unclear():
+    """Second-pass extraction for papers still marked unclear quadrant."""
+    return rebuild_unclear_papers(store=store, env_path=ENV_PATH)
+
+
+@app.get("/paper_info")
+def paper_info(paper_id: str):
+    """Return metadata for a specific paper from the CE database."""
+    rows = query_sql(
+        "SELECT * FROM ce_comparisons WHERE paper_id = ?", (paper_id,)
+    )
+    if not rows:
+        return {"found": False, "paper_id": paper_id}
+
+    import re as _re
+    year_m = _re.search(r'\b(19|20)\d{2}\b', paper_id)
+    year = year_m.group(0) if year_m else "unknown"
+
+    first = rows[0]
+    quadrants = [r["quadrant"] for r in rows]
+    icers = [r["icer"] for r in rows if r.get("icer") not in (None, "unknown", "")]
+    conclusions = [r["ce_conclusion"] for r in rows]
+
+    return {
+        "found":            True,
+        "paper_id":         paper_id,
+        "year":             year,
+        "body_region":      first.get("body_region", "unknown"),
+        "condition":        first.get("condition", "unknown"),
+        "perspective":      first.get("perspective", "unknown"),
+        "time_horizon":     first.get("time_horizon", "unknown"),
+        "intervention_type": first.get("intervention_type", "unknown"),
+        "comparator_type":  first.get("comparator_type", "unknown"),
+        "quadrants":        quadrants,
+        "icer":             icers[0] if len(icers) == 1 else (icers if icers else "unknown"),
+        "ce_conclusion":    conclusions[0] if len(set(conclusions)) == 1 else conclusions,
+        "num_comparisons":  len(rows),
+    }
 
 
 @app.get("/list_papers")
