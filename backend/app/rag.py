@@ -99,14 +99,21 @@ _INTENT_MODEL = {
 }
 
 
+def _is_review_paper(paper_id: Optional[str]) -> bool:
+    if not paper_id:
+        return False
+    pid = paper_id.lower()
+    return "systematic review" in pid or "review of trial" in pid
+
+
 def _adaptive_settings(question: str, intent: str, paper_id: Optional[str]) -> tuple:
     """Return (k, model) tuned to the question intent."""
+    # Systematic review paper: maximum retrieval — it covers all 78 papers
+    if _is_review_paper(paper_id):
+        return 20, _INTENT_MODEL.get("general")
+
     k = _INTENT_K.get(intent, 8)
     model = _INTENT_MODEL.get(intent, None)
-
-    # Figure questions: fewer text chunks needed — vision handles the heavy lifting
-    if is_figure_question(question) and paper_id:
-        k = 4
 
     # Cross-paper (no paper filter): retrieve more to cover breadth
     if not paper_id:
@@ -273,9 +280,11 @@ def answer_question(
             pdf_path = matches[0] if matches else None
 
         if pdf_path and pdf_path.exists():
-            retrieved_pages = [h["meta"]["page"] for h in all_hits[:6]]
+            is_review = _is_review_paper(paper_id)
+            max_pages = 10 if is_review else 6
+            retrieved_pages = [h["meta"]["page"] for h in all_hits[:10]]
             pages_to_render = get_pages_for_question(
-                str(pdf_path), question, retrieved_pages
+                str(pdf_path), question, retrieved_pages, max_pages=max_pages
             )
             images = [
                 img for p in pages_to_render
@@ -283,13 +292,15 @@ def answer_question(
             ]
             if images:
                 try:
-                    # Supplement with database counts for counting questions
-                    db_context = ""
+                    from .ce_db import query_sql
+
+                    # Always build DB context for review paper; only for count
+                    # questions otherwise
                     _count_kw = {"how many", "count", "number of", "dominant",
                                  "dominated", "quadrant", "cost-effective", "icer"}
-                    if any(k in question.lower() for k in _count_kw):
-                        from .ce_db import query_sql
-
+                    need_db = is_review or any(k in question.lower() for k in _count_kw)
+                    db_context = ""
+                    if need_db:
                         # Per-paper counts
                         paper_rows = query_sql(
                             "SELECT * FROM ce_comparisons WHERE paper_id = ?",
@@ -300,10 +311,10 @@ def answer_question(
                             q = r.get("quadrant", "unclear")
                             paper_quad[q] = paper_quad.get(q, 0) + 1
 
-                        # Cross-paper aggregate (used when this paper is a review
-                        # and its figures show many individual study comparisons)
+                        # Cross-paper aggregate
                         all_rows = query_sql(
-                            "SELECT quadrant, ce_conclusion FROM ce_comparisons "
+                            "SELECT paper_id, quadrant, ce_conclusion, body_region, "
+                            "comparator_type FROM ce_comparisons "
                             "WHERE quadrant != 'unclear'", ()
                         )
                         all_quad = {}
@@ -312,21 +323,22 @@ def answer_question(
                             all_quad[q] = all_quad.get(q, 0) + 1
 
                         db_context = (
-                            f"\n\n--- DATABASE COUNTS (use these for exact numbers) ---"
-                            f"\nThis paper's extracted comparisons: {len(paper_rows)}, "
-                            f"quadrant breakdown: {paper_quad}."
-                            f"\nAcross ALL 78 papers in the database "
-                            f"(excluding unclear): {all_quad}. "
-                            f"Total classified: {sum(all_quad.values())}."
-                            f"\nIf the figure shows data from multiple studies, "
-                            f"use the cross-paper counts above as the authoritative answer."
+                            f"\n\n--- EXTRACTED DATABASE SUMMARY ---"
+                            f"\nThis systematic review covers 78 individual papers."
+                            f"\nClassified comparisons across all papers: {all_quad}. "
+                            f"Total classified: {sum(all_quad.values())} "
+                            f"(remaining are unclear/unclassified)."
+                            f"\nUse these counts as the authoritative answer for any "
+                            f"question about how many comparisons are dominant, dominated, "
+                            f"NE, or SW across the studies in this review."
                         )
+
                     answer = llm.vision_chat(
                         question=question,
                         images_b64=images,
-                        context=context[:2000] + db_context,
+                        context=context[:3000] + db_context,
                         think=False,
-                        timeout=120,
+                        timeout=180,
                     )
                     return {
                         "answer":  answer,
