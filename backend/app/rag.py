@@ -244,10 +244,32 @@ def answer_question(
             ]
             if images:
                 try:
+                    # Supplement with database data for this paper if count is asked
+                    db_context = ""
+                    _count_kw = {"how many", "count", "number of", "dominant",
+                                 "dominated", "quadrant", "cost-effective", "icer"}
+                    if any(k in question.lower() for k in _count_kw) and paper_id:
+                        from .ce_db import query_sql
+                        rows = query_sql(
+                            "SELECT * FROM ce_comparisons WHERE paper_id = ?",
+                            (paper_id,)
+                        )
+                        if rows:
+                            quad_counts = {}
+                            for r in rows:
+                                q = r.get("quadrant", "unclear")
+                                quad_counts[q] = quad_counts.get(q, 0) + 1
+                            db_context = (
+                                f"\n\nExtracted data for this paper: "
+                                f"{len(rows)} comparison(s). "
+                                f"Quadrant counts: {quad_counts}. "
+                                f"CE conclusion: "
+                                f"{[r.get('ce_conclusion') for r in rows]}."
+                            )
                     answer = llm.vision_chat(
                         question=question,
                         images_b64=images,
-                        context=context[:3000],
+                        context=context[:2000] + db_context,
                         think=False,
                         timeout=120,
                     )

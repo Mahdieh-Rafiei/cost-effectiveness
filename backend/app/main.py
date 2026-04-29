@@ -46,6 +46,8 @@ from .rag import answer_question
 from .ce_build import build_ce_table
 from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
+from .vision import (is_figure_question, get_pages_for_question,
+                     render_page_as_base64, extract_figure_ref)
 
 _default_env = Path(__file__).resolve().parent.parent.parent / ".env"
 ENV_PATH = os.getenv("ENV_PATH", str(_default_env) if _default_env.exists() else None)
@@ -840,6 +842,34 @@ Guidelines:
             f"Data:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
         )},
     ]
+
+    # ── Vision: add visual description of Figure 4/5 if PDF is available ────────
+    if intents["fig4"] or intents["fig5"] or intents["both_figs"]:
+        fig_num = extract_figure_ref(question) or ("4" if intents["fig4"] else "5")
+        try:
+            sr_pdfs = sorted(PDF_DIR.glob("*.pdf"),
+                             key=lambda p: (
+                                 "systematic" not in p.stem.lower()
+                                 and "review" not in p.stem.lower()
+                             ))
+            if sr_pdfs:
+                pdf_path = str(sr_pdfs[0])
+                pages = get_pages_for_question(pdf_path, f"Figure {fig_num}", [], max_pages=3)
+                images = [img for p in pages
+                          if (img := render_page_as_base64(pdf_path, p)) is not None]
+                if images:
+                    llm_v = OllamaClient(env_path=ENV_PATH)
+                    vision_desc = llm_v.vision_chat(
+                        question=(f"Describe what Figure {fig_num} shows in this "
+                                  f"cost-effectiveness paper page. Focus on axes, "
+                                  f"data point distribution, and quadrants."),
+                        images_b64=images,
+                        think=False,
+                        timeout=90,
+                    )
+                    payload["figure_visual_description"] = vision_desc
+        except Exception as e:
+            print(f"[vision/compare] {e}")
 
     answer = _llm_narrative(messages)
     return {"answer": answer, "rows": region_rows, "structured_summary": payload}
