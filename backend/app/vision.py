@@ -10,7 +10,7 @@ from typing import List, Optional
 import fitz  # PyMuPDF — already a dependency
 
 
-def render_page_as_base64(pdf_path: str, page_num: int, dpi: int = 150) -> Optional[str]:
+def render_page_as_base64(pdf_path: str, page_num: int, dpi: int = 250) -> Optional[str]:
     """
     Render a single PDF page (1-indexed) as base64 PNG.
     Returns None if the page doesn't exist or rendering fails.

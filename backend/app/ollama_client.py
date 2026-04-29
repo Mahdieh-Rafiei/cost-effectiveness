@@ -105,12 +105,25 @@ class OllamaClient:
                     context: str = "", think: bool = False,
                     timeout: int = 120) -> str:
         vision_model = os.getenv("OLLAMA_VISION_MODEL", "gemma4:latest")
-        content = question
+        system = (
+            "You are a medical research assistant analysing pages from a physiotherapy "
+            "cost-effectiveness paper. The images show PDF pages that may contain: "
+            "cost-effectiveness planes (scatter plots with 4 quadrants labelled dominant, "
+            "dominated, NE, SW), tables, bar charts, or forest plots. "
+            "Describe exactly what you see in the figures/tables on these pages. "
+            "If a CE plane is shown, state which quadrant each intervention falls in and "
+            "count dominant vs dominated comparisons. "
+            "Never say a figure is 'not visible' — describe the page content you can see."
+        )
+        user_content = question
         if context:
-            content = f"Context from paper text:\n{context}\n\nQuestion: {question}"
+            user_content = f"Context from paper text:\n{context}\n\nQuestion: {question}"
         payload = {
             "model": vision_model,
-            "messages": [{"role": "user", "content": content, "images": images_b64}],
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content, "images": images_b64},
+            ],
             "think": think,
             "stream": False,
         }
