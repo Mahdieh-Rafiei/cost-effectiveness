@@ -140,6 +140,23 @@ def _post(url: str, payload: dict) -> dict:
         return {"error": str(e)}
 
 
+def _stream_ask(payload: dict):
+    """Yield text chunks from /ask_stream."""
+    try:
+        with requests.post(
+            f"{API_BASE}/ask_stream",
+            json=payload,
+            stream=True,
+            timeout=360,
+        ) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
+                if chunk:
+                    yield chunk
+    except Exception as e:
+        yield f"\n\n⚠️ Stream error: {e}"
+
+
 def _api_ok() -> bool:
     try:
         requests.get(f"{API_BASE}/status", timeout=4)
@@ -233,15 +250,23 @@ with st.sidebar:
             st.session_state.paper_list = _load_papers()
         papers = st.session_state.paper_list
         if papers:
-            sp = st.selectbox(
-                "Paper",
-                options=papers,
+            search = st.text_input(
+                "Search paper", placeholder="Type to filter papers…",
                 label_visibility="collapsed",
-                key="paper_selectbox",
+            )
+            filtered = (
+                [p for p in papers if search.lower() in p.lower()]
+                if search else papers
+            )
+            if not filtered:
+                filtered = papers
+            sp = st.selectbox(
+                "Paper", options=filtered,
+                label_visibility="collapsed", key="paper_selectbox",
             )
             st.session_state.selected_paper = sp
         else:
-            st.warning("No papers found. Run /build_ce_table first.")
+            st.warning("No papers found.")
             st.session_state.selected_paper = ""
 
     top_k = st.slider("Chunks retrieved (RAG)", 4, 60, 12,
@@ -338,17 +363,21 @@ for msg in st.session_state.messages:
 user_q = st.chat_input("Ask anything about the cost-effectiveness papers…")
 
 if user_q:
-    # Guard: single-paper mode needs a paper selected
     if mode == "Single-paper" and not st.session_state.selected_paper:
         st.warning("Please select a paper in the sidebar first.")
         st.stop()
 
-    # Store user message
     st.session_state.messages.append({"role": "user", "content": user_q})
     with st.chat_message("user"):
         st.markdown(user_q)
 
-    # Route
+    # Build conversation history (last 6 messages = 3 exchanges)
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.messages[-7:-1]  # exclude the just-added user msg
+        if m["role"] in ("user", "assistant")
+    ]
+
     q_lower = user_q.lower()
     if mode == "Cross-paper":
         use_compare = True
@@ -358,46 +387,38 @@ if user_q:
         use_compare = any(k in q_lower for k in CROSS_KW)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking…"):
-            if use_compare:
-                route_label = "cross-paper"
-                data = _post("/ask_compare", {"question": user_q})
-            else:
-                route_label = f"single-paper · {st.session_state.selected_paper or 'all'}"
-                data = _post("/ask", {
-                    "question": user_q,
-                    "top_k": int(top_k),
-                    "paper_id": st.session_state.selected_paper or None,
-                })
-
-        if "error" in data:
-            answer = f"⚠️ Error: {data['error']}"
-            sources = []
-        else:
-            answer = data.get("answer", "No answer returned.")
-            sources = data.get("sources", [])
-            # Deduplicate sources
-            seen: set = set()
-            unique_sources = []
-            for s in sources:
-                key = (s.get("paper_id"), s.get("page"))
-                if key not in seen:
-                    seen.add(key)
-                    unique_sources.append(s)
-            sources = unique_sources
-
-        # Mode badge + answer
         st.markdown(
-            f'<div class="mode-badge">{"🔀" if use_compare else "📄"} {route_label}</div>',
+            f'<div class="mode-badge">{"🔀" if use_compare else "📄"} '
+            f'{"cross-paper" if use_compare else (st.session_state.selected_paper or "all")}'
+            f'</div>',
             unsafe_allow_html=True,
         )
-        st.markdown(answer)
 
-        # Store
+        if use_compare:
+            with st.spinner("Thinking…"):
+                data = _post("/ask_compare", {"question": user_q})
+            answer = (
+                data.get("answer", "No answer returned.")
+                if "error" not in data else f"⚠️ Error: {data['error']}"
+            )
+            st.markdown(answer)
+        else:
+            # Single-paper: stream tokens in real time
+            placeholder = st.empty()
+            answer = ""
+            for chunk in _stream_ask({
+                "question": user_q,
+                "top_k": int(top_k),
+                "paper_id": st.session_state.selected_paper or None,
+                "history": history,
+            }):
+                answer += chunk
+                placeholder.markdown(answer + "▌")
+            placeholder.markdown(answer)
+
         st.session_state.messages.append({
             "role": "assistant",
             "content": answer,
-            "sources": sources,
         })
 
 

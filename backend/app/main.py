@@ -33,6 +33,7 @@ Endpoints:
 """
 
 from fastapi import FastAPI, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -42,7 +43,7 @@ import os
 from .pdf_extract import extract_pdf_pages
 from .chunking import make_chunks
 from .vectorstore import VectorStore
-from .rag import answer_question
+from .rag import answer_question, answer_question_stream
 from .ce_build import build_ce_table
 from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
@@ -73,6 +74,7 @@ class AskRequest(BaseModel):
     question: str
     top_k: int = 8
     paper_id: Optional[str] = None
+    history: List[dict] = []
 
 class CompareRequest(BaseModel):
     question: str
@@ -161,6 +163,8 @@ def ingest(req: IngestRequest):
 
 @app.post("/ask")
 def ask(req: AskRequest):
+    history = [{"role": h["role"], "content": h["content"]}
+               for h in req.history if h.get("role") in ("user", "assistant")]
     return answer_question(
         req.question,
         store=store,
@@ -169,7 +173,28 @@ def ask(req: AskRequest):
         paper_id=req.paper_id,
         chat_model=_chat_model,
         pdf_dir=str(PDF_DIR),
+        history=history,
     )
+
+
+@app.post("/ask_stream")
+def ask_stream(req: AskRequest):
+    history = [{"role": h["role"], "content": h["content"]}
+               for h in req.history if h.get("role") in ("user", "assistant")]
+
+    def generate():
+        for chunk in answer_question_stream(
+            req.question,
+            store=store,
+            env_path=ENV_PATH,
+            paper_id=req.paper_id,
+            chat_model=_chat_model,
+            pdf_dir=str(PDF_DIR),
+            history=history,
+        ):
+            yield chunk
+
+    return StreamingResponse(generate(), media_type="text/plain")
 
 
 @app.get("/status")

@@ -1,16 +1,18 @@
 """
 RAG (Retrieval-Augmented Generation) for single-paper and cross-paper Q&A.
 
-Improvements over the original:
 - Intent detection: question type shapes retrieval queries and system prompt
 - Multi-query retrieval: up to 3 specialised queries merged and deduplicated
 - Relevance filtering: chunks beyond a distance threshold are dropped
 - Chunk deduplication: near-identical snippets removed before context build
-- Source deduplication: unique paper+page pairs only
+- Adaptive k + model: automatically tuned to question intent
+- Vision augmentation: always-on for single-paper mode (tables, figures, text)
+- Conversation history: last N exchanges included for follow-up questions
+- Streaming: answer_question_stream() yields tokens for real-time display
 """
 
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Generator
 
 from .vectorstore import VectorStore
 from .ollama_client import OllamaClient
@@ -53,9 +55,7 @@ def _detect_intent(question: str) -> str:
 
 
 def _expand_queries(question: str, intent: str) -> List[str]:
-    """Return 1-3 retrieval queries: the original plus intent-specific expansions."""
     queries = [question]
-
     if intent == "ce":
         queries.append(
             "ICER incremental cost-effectiveness ratio dominant dominated "
@@ -76,26 +76,25 @@ def _expand_queries(question: str, intent: str) -> List[str]:
             "randomized controlled trial RCT participants sample size "
             "country setting time horizon perspective societal healthcare"
         )
-
     return queries
 
 
 # ── Adaptive retrieval settings ───────────────────────────────────────────────
 
 _INTENT_K = {
-    "ce":           6,   # factual lookup — fewer focused chunks
+    "ce":           6,
     "intervention": 8,
     "outcomes":     8,
     "design":       8,
-    "general":      12,  # open-ended — cast wider net
+    "general":      12,
 }
 
 _INTENT_MODEL = {
-    "ce":           "llama3.1:8b",   # fast; ICER values are in the text
+    "ce":           "llama3.1:8b",
     "intervention": "llama3.1:8b",
     "outcomes":     "llama3.1:8b",
     "design":       "llama3.1:8b",
-    "general":      "qwen3.5:9b",    # more reasoning for open-ended questions
+    "general":      "qwen3.5:9b",
 }
 
 
@@ -107,18 +106,12 @@ def _is_review_paper(paper_id: Optional[str]) -> bool:
 
 
 def _adaptive_settings(question: str, intent: str, paper_id: Optional[str]) -> tuple:
-    """Return (k, model) tuned to the question intent."""
-    # Systematic review paper: maximum retrieval — it covers all 78 papers
     if _is_review_paper(paper_id):
         return 20, _INTENT_MODEL.get("general")
-
     k = _INTENT_K.get(intent, 8)
     model = _INTENT_MODEL.get(intent, None)
-
-    # Cross-paper (no paper filter): retrieve more to cover breadth
     if not paper_id:
         k = max(k, 12)
-
     return k, model
 
 
@@ -160,10 +153,8 @@ def _build_system_prompt(intent: str) -> str:
     return f"{_BASE_SYSTEM}\n{extra}"
 
 
-# ── Context building with deduplication and relevance filtering ───────────────
+# ── Context building ──────────────────────────────────────────────────────────
 
-# ChromaDB L2 distance for nomic-embed-text: 0–0.5 = very similar, 0.5–1.5 = relevant,
-# 1.5–2.0 = loosely related. Use a generous threshold and rely on top-k for quality.
 _DISTANCE_THRESHOLD = 1.8
 
 
@@ -175,29 +166,21 @@ def _build_context(
     seen_text: set = set()
     parts: List[str] = []
     used = 0
-
     for h in hits:
-        # Relevance filter
         dist = h.get("distance", 0.0)
         if not ignore_threshold and dist > _DISTANCE_THRESHOLD:
             continue
-
-        # Near-duplicate suppression (first 120 chars as fingerprint)
         fp = h["text"][:120].strip()
         if fp in seen_text:
             continue
         seen_text.add(fp)
-
         paper = h["meta"]["paper_id"]
         page  = h["meta"]["page"]
         block = f"[{paper} p.{page}] {h['text']}"
-
         if used + len(block) > max_chars:
             break
-
         parts.append(block)
         used += len(block)
-
     return "\n\n".join(parts)
 
 
@@ -212,30 +195,38 @@ def _dedup_sources(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Shared RAG preparation ────────────────────────────────────────────────────
 
-def answer_question(
+def _build_rag_inputs(
     question: str,
     store: VectorStore,
-    env_path: Optional[str] = None,
-    k: int = 8,
-    paper_id: Optional[str] = None,
-    chat_model: Optional[str] = None,
-    pdf_dir: Optional[str] = None,
+    env_path: Optional[str],
+    paper_id: Optional[str],
+    pdf_dir: Optional[str],
+    history: Optional[List[dict]],
 ) -> dict:
+    """
+    Do all retrieval, context building, and vision rendering.
+    Returns a dict with:
+      - error: str             early exit (no hits / no context)
+      - vision_answer: str     complete answer from vision model (skip LLM call)
+      - messages: list         LLM messages for text path (includes history)
+      - all_hits: list
+      - intent: str
+      - chat_model: str | None
+      - llm: OllamaClient
+    """
     intent = _detect_intent(question)
     adaptive_k, adaptive_model = _adaptive_settings(question, intent, paper_id)
-    k = adaptive_k
-    chat_model = chat_model or adaptive_model
     queries = _expand_queries(question, intent)
     where   = {"paper_id": paper_id} if paper_id else None
 
-    # Multi-query retrieval — merge and deduplicate by text fingerprint
+    # Multi-query retrieval
     all_hits: List[Dict[str, Any]] = []
     seen_fp: set = set()
     for query in queries:
         try:
-            hits = store.query(query, k=k, where=where)
+            hits = store.query(query, k=adaptive_k, where=where)
         except Exception:
             hits = []
         for h in hits:
@@ -244,35 +235,27 @@ def answer_question(
                 seen_fp.add(fp)
                 all_hits.append(h)
 
-    # Sort by distance (best first)
     all_hits.sort(key=lambda h: h.get("distance", 0.0))
 
     if not all_hits:
-        return {
-            "answer": "I could not find relevant excerpts for this question.",
-            "sources": [],
-            "intent": intent,
-        }
+        return {"error": "I could not find relevant excerpts for this question.",
+                "all_hits": [], "intent": intent}
 
     context = _build_context(all_hits)
-
     if not context.strip():
-        # Last resort: take top-3 hits regardless of distance
-        all_hits.sort(key=lambda h: h.get("distance", 0.0))
         context = _build_context(all_hits[:3], max_chars=14000, ignore_threshold=True)
-
     if not context.strip():
         return {
-            "answer": "I could not find relevant text for this question in the indexed papers. "
-                      "Make sure the paper is ingested (run ingest_all.py) and try rephrasing.",
-            "sources": [],
-            "intent": intent,
+            "error": (
+                "I could not find relevant text for this question in the indexed papers. "
+                "Make sure the paper is ingested and try rephrasing."
+            ),
+            "all_hits": all_hits, "intent": intent,
         }
 
     llm = OllamaClient(env_path=env_path)
 
-    # Vision augmentation: always use vision in single-paper mode so the model
-    # can answer from tables, figures, equations, and text — not just text chunks.
+    # Vision path — always active in single-paper mode
     if paper_id and pdf_dir:
         pdf_path = Path(pdf_dir) / f"{paper_id}.pdf"
         if not pdf_path.exists():
@@ -294,30 +277,26 @@ def answer_question(
                 try:
                     from .ce_db import query_sql
 
-                    # Always build DB context for review paper; only for count
-                    # questions otherwise
                     _count_kw = {"how many", "count", "number of", "dominant",
                                  "dominated", "quadrant", "cost-effective", "icer"}
                     need_db = is_review or any(k in question.lower() for k in _count_kw)
                     db_context = ""
                     if need_db:
-                        # Per-paper counts
                         paper_rows = query_sql(
                             "SELECT * FROM ce_comparisons WHERE paper_id = ?",
                             (paper_id,)
                         )
-                        paper_quad = {}
+                        paper_quad: Dict[str, int] = {}
                         for r in paper_rows:
                             q = r.get("quadrant", "unclear")
                             paper_quad[q] = paper_quad.get(q, 0) + 1
 
-                        # Cross-paper aggregate
                         all_rows = query_sql(
                             "SELECT paper_id, quadrant, ce_conclusion, body_region, "
                             "comparator_type FROM ce_comparisons "
                             "WHERE quadrant != 'unclear'", ()
                         )
-                        all_quad = {}
+                        all_quad: Dict[str, int] = {}
                         for r in all_rows:
                             q = r.get("quadrant", "unclear")
                             all_quad[q] = all_quad.get(q, 0) + 1
@@ -333,7 +312,7 @@ def answer_question(
                             f"NE, or SW across the studies in this review."
                         )
 
-                    answer = llm.vision_chat(
+                    vision_answer = llm.vision_chat(
                         question=question,
                         images_b64=images,
                         context=context[:3000] + db_context,
@@ -341,22 +320,91 @@ def answer_question(
                         timeout=180,
                     )
                     return {
-                        "answer":  answer,
-                        "sources": _dedup_sources(all_hits),
-                        "intent":  intent,
-                        "mode":    "vision",
+                        "vision_answer": vision_answer,
+                        "all_hits": all_hits,
+                        "intent": intent,
+                        "chat_model": adaptive_model,
+                        "llm": llm,
                     }
                 except Exception as e:
                     print(f"[vision] failed, falling back to RAG: {e}")
 
-    messages = [
-        {"role": "system", "content": _build_system_prompt(intent)},
-        {"role": "user",   "content": f"Question:\n{question}\n\nEvidence excerpts:\n{context}"},
-    ]
-    answer = llm.chat(messages, temperature=0.1, model=chat_model)
+    # Text path — build messages with conversation history
+    messages: List[dict] = [{"role": "system", "content": _build_system_prompt(intent)}]
+    if history:
+        for h in history[-6:]:   # last 3 exchanges
+            if h.get("role") in ("user", "assistant"):
+                messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({
+        "role": "user",
+        "content": f"Question:\n{question}\n\nEvidence excerpts:\n{context}",
+    })
 
     return {
-        "answer":  answer,
-        "sources": _dedup_sources(all_hits),
-        "intent":  intent,
+        "vision_answer": None,
+        "messages": messages,
+        "all_hits": all_hits,
+        "intent": intent,
+        "chat_model": adaptive_model,
+        "llm": llm,
     }
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def answer_question(
+    question: str,
+    store: VectorStore,
+    env_path: Optional[str] = None,
+    k: int = 8,
+    paper_id: Optional[str] = None,
+    chat_model: Optional[str] = None,
+    pdf_dir: Optional[str] = None,
+    history: Optional[List[dict]] = None,
+) -> dict:
+    result = _build_rag_inputs(question, store, env_path, paper_id, pdf_dir, history)
+
+    if "error" in result:
+        return {"answer": result["error"], "sources": [], "intent": result["intent"]}
+
+    if result.get("vision_answer"):
+        return {
+            "answer":  result["vision_answer"],
+            "sources": _dedup_sources(result["all_hits"]),
+            "intent":  result["intent"],
+            "mode":    "vision",
+        }
+
+    llm = result["llm"]
+    model = chat_model or result["chat_model"]
+    answer = llm.chat(result["messages"], temperature=0.1, model=model)
+    return {
+        "answer":  answer,
+        "sources": _dedup_sources(result["all_hits"]),
+        "intent":  result["intent"],
+    }
+
+
+def answer_question_stream(
+    question: str,
+    store: VectorStore,
+    env_path: Optional[str] = None,
+    paper_id: Optional[str] = None,
+    chat_model: Optional[str] = None,
+    pdf_dir: Optional[str] = None,
+    history: Optional[List[dict]] = None,
+) -> Generator[str, None, None]:
+    result = _build_rag_inputs(question, store, env_path, paper_id, pdf_dir, history)
+
+    if "error" in result:
+        yield result["error"]
+        return
+
+    if result.get("vision_answer"):
+        # Vision answers are already complete — yield as one chunk
+        yield result["vision_answer"]
+        return
+
+    llm = result["llm"]
+    model = chat_model or result["chat_model"]
+    yield from llm.chat_stream(result["messages"], temperature=0.1, model=model)

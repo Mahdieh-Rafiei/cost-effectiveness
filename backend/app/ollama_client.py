@@ -1,8 +1,9 @@
 import os
+import json
 import time
 import requests
 from dotenv import load_dotenv
-from typing import Optional, List
+from typing import Optional, List, Generator
 
 
 def load_env(env_path: Optional[str] = None):
@@ -100,6 +101,35 @@ class OllamaClient:
                     continue
                 raise
         raise RuntimeError(f"Chat failed after {max_retries} retries")
+
+    def chat_stream(self, messages: list, temperature: float = 0.2,
+                    model: Optional[str] = None,
+                    timeout: int = 300) -> Generator[str, None, None]:
+        payload = {
+            "model": model or self.chat_model,
+            "messages": messages,
+            "options": {"temperature": temperature},
+            "think": False,
+            "stream": True,
+        }
+        with requests.post(
+            f"{self.api_url}/api/chat",
+            headers=self.headers,
+            json=payload,
+            stream=True,
+            timeout=timeout,
+        ) as r:
+            if r.status_code >= 400:
+                raise RuntimeError(f"Chat stream error {r.status_code}: {r.text}")
+            for line in r.iter_lines():
+                if line:
+                    try:
+                        j = json.loads(line)
+                        content = j.get("message", {}).get("content", "")
+                        if content:
+                            yield content
+                    except Exception:
+                        pass
 
     def vision_chat(self, question: str, images_b64: List[str],
                     context: str = "", think: bool = False,
