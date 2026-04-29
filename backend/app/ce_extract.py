@@ -190,7 +190,7 @@ def extract_comparisons(
         },
     ]
 
-    raw = llm.chat(messages, temperature=0.0)
+    raw = llm.chat(messages, temperature=0.0, think=False, timeout=600)
 
     try:
         parsed = _extract_json_block(raw)

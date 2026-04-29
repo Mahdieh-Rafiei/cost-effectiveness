@@ -61,11 +61,13 @@ class OllamaClient:
         return out
 
     def chat(self, messages: list, temperature: float = 0.2,
-             model: Optional[str] = None) -> str:
+             model: Optional[str] = None, think: bool = False,
+             timeout: int = 180) -> str:
         payload = {
             "model": model or self.chat_model,
             "messages": messages,
             "options": {"temperature": temperature},
+            "think": think,
             "stream": False,
         }
 
@@ -73,7 +75,7 @@ class OllamaClient:
             f"{self.api_url}/api/chat",
             headers=self.headers,
             json=payload,
-            timeout=180,
+            timeout=timeout,
         )
 
         if r.status_code >= 400:
