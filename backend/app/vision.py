@@ -30,18 +30,22 @@ def render_page_as_base64(pdf_path: str, page_num: int, dpi: int = 150) -> Optio
         return None
 
 
-def find_figure_pages(pdf_path: str, figure_ref: str) -> List[int]:
+def find_figure_pages(pdf_path: str, figure_num: str) -> List[int]:
     """
-    Search all pages for a figure reference (e.g. 'Figure 4', 'Fig. 2').
+    Search all pages for a figure number (e.g. '4', '4a').
+    Matches 'Fig. 4', 'Figure 4', 'fig 4' etc.
     Returns a list of 1-indexed page numbers.
     """
     try:
         doc = fitz.open(pdf_path)
         pages = []
-        ref_lower = figure_ref.lower()
+        pattern = re.compile(
+            rf'\bfig(?:ure)?\.?\s*{re.escape(figure_num)}\b',
+            re.IGNORECASE,
+        )
         for i in range(doc.page_count):
-            text = doc[i].get_text("text").lower()
-            if ref_lower in text:
+            text = doc[i].get_text("text")
+            if pattern.search(text):
                 pages.append(i + 1)
         doc.close()
         return pages
@@ -51,12 +55,11 @@ def find_figure_pages(pdf_path: str, figure_ref: str) -> List[int]:
 
 def extract_figure_ref(question: str) -> Optional[str]:
     """
-    Extract a figure or table reference from the question.
-    e.g. 'What does Figure 4 show?' -> 'figure 4'
+    Extract the figure NUMBER from the question.
+    e.g. 'What does Figure 4 show?' -> '4'
     """
-    m = re.search(r'\b(fig(?:ure)?\.?\s*\d+[a-z]?|table\s*\d+[a-z]?)\b',
-                  question, re.IGNORECASE)
-    return m.group(0).lower().replace(".", "").replace("  ", " ") if m else None
+    m = re.search(r'\bfig(?:ure)?\.?\s*(\d+[a-z]?)\b', question, re.IGNORECASE)
+    return m.group(1) if m else None
 
 
 def is_figure_question(question: str) -> bool:
@@ -78,9 +81,9 @@ def get_pages_for_question(
     """
     pages: List[int] = []
 
-    figure_ref = extract_figure_ref(question)
-    if figure_ref:
-        fig_pages = find_figure_pages(pdf_path, figure_ref)
+    figure_num = extract_figure_ref(question)
+    if figure_num:
+        fig_pages = find_figure_pages(pdf_path, figure_num)
         pages.extend(fig_pages)
 
     # Add surrounding page for each figure page (caption often on next page)
