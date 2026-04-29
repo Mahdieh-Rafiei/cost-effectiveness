@@ -331,12 +331,6 @@ CROSS_KW = [
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        if msg.get("sources"):
-            pills = " ".join(
-                f'<span class="source-pill">{s["paper_id"]} p.{s["page"]}</span>'
-                for s in msg["sources"]
-            )
-            st.markdown(pills, unsafe_allow_html=True)
 
 
 # ── Chat input ────────────────────────────────────────────────────────────────
@@ -398,14 +392,6 @@ if user_q:
             unsafe_allow_html=True,
         )
         st.markdown(answer)
-
-        # Source pills
-        if sources:
-            pills = " ".join(
-                f'<span class="source-pill">{s["paper_id"]} p.{s["page"]}</span>'
-                for s in sources
-            )
-            st.markdown(pills, unsafe_allow_html=True)
 
         # Store
         st.session_state.messages.append({

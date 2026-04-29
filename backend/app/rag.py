@@ -229,9 +229,11 @@ def answer_question(
     # Vision augmentation: render PDF pages when asking about figures in a specific paper
     if is_figure_question(question) and paper_id and pdf_dir:
         pdf_path = Path(pdf_dir) / f"{paper_id}.pdf"
+        print(f"[vision] checking PDF: {pdf_path} exists={pdf_path.exists()}")
         if not pdf_path.exists():
             matches = sorted(Path(pdf_dir).glob(f"{paper_id}*.pdf"))
             pdf_path = matches[0] if matches else None
+            print(f"[vision] glob fallback: {pdf_path}")
 
         if pdf_path and pdf_path.exists():
             retrieved_pages = [h["meta"]["page"] for h in all_hits[:6]]
@@ -242,6 +244,7 @@ def answer_question(
                 img for p in pages_to_render
                 if (img := render_page_as_base64(str(pdf_path), p)) is not None
             ]
+            print(f"[vision] pages={pages_to_render} images_rendered={len(images)}")
             if images:
                 try:
                     # Supplement with database data for this paper if count is asked
