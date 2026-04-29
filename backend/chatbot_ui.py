@@ -379,17 +379,37 @@ if user_q:
     ]
 
     q_lower = user_q.lower()
+
+    # Keywords that indicate Figure 4 / Figure 5 from the systematic review
+    _FIG_KW = {"fig 4", "figure 4", "fig4", "fig 5", "figure 5", "fig5",
+               "both figure", "compare figure"}
+
+    # paper_id to use for the request (may be auto-resolved)
+    active_paper_id = st.session_state.selected_paper or None
+
     if mode == "Cross-paper":
         use_compare = True
     elif mode == "Single-paper":
         use_compare = False
     else:
-        use_compare = any(k in q_lower for k in CROSS_KW)
+        # Auto: figure 4/5 questions always go to the systematic review via vision
+        if any(k in q_lower for k in _FIG_KW):
+            use_compare = False
+            if not active_paper_id:
+                if not st.session_state.paper_list:
+                    st.session_state.paper_list = _load_papers()
+                active_paper_id = next(
+                    (p for p in st.session_state.paper_list
+                     if "systematic review" in p.lower() or "review of trial" in p.lower()),
+                    None,
+                )
+        else:
+            use_compare = any(k in q_lower for k in CROSS_KW)
 
     with st.chat_message("assistant"):
         st.markdown(
             f'<div class="mode-badge">{"🔀" if use_compare else "📄"} '
-            f'{"cross-paper" if use_compare else (st.session_state.selected_paper or "all")}'
+            f'{"cross-paper" if use_compare else (active_paper_id or "all")}'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -409,7 +429,7 @@ if user_q:
             for chunk in _stream_ask({
                 "question": user_q,
                 "top_k": int(top_k),
-                "paper_id": st.session_state.selected_paper or None,
+                "paper_id": active_paper_id,
                 "history": history,
             }):
                 answer += chunk
