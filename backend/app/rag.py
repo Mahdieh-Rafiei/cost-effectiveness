@@ -80,6 +80,41 @@ def _expand_queries(question: str, intent: str) -> List[str]:
     return queries
 
 
+# ── Adaptive retrieval settings ───────────────────────────────────────────────
+
+_INTENT_K = {
+    "ce":           6,   # factual lookup — fewer focused chunks
+    "intervention": 8,
+    "outcomes":     8,
+    "design":       8,
+    "general":      12,  # open-ended — cast wider net
+}
+
+_INTENT_MODEL = {
+    "ce":           "llama3.1:8b",   # fast; ICER values are in the text
+    "intervention": "llama3.1:8b",
+    "outcomes":     "llama3.1:8b",
+    "design":       "llama3.1:8b",
+    "general":      "qwen3.5:9b",    # more reasoning for open-ended questions
+}
+
+
+def _adaptive_settings(question: str, intent: str, paper_id: Optional[str]) -> tuple:
+    """Return (k, model) tuned to the question intent."""
+    k = _INTENT_K.get(intent, 8)
+    model = _INTENT_MODEL.get(intent, None)
+
+    # Figure questions: fewer text chunks needed — vision handles the heavy lifting
+    if is_figure_question(question) and paper_id:
+        k = 4
+
+    # Cross-paper (no paper filter): retrieve more to cover breadth
+    if not paper_id:
+        k = max(k, 12)
+
+    return k, model
+
+
 # ── System prompts ────────────────────────────────────────────────────────────
 
 _BASE_SYSTEM = """You are an evidence-grounded research assistant specialising in physiotherapy cost-effectiveness.
@@ -182,6 +217,9 @@ def answer_question(
     pdf_dir: Optional[str] = None,
 ) -> dict:
     intent = _detect_intent(question)
+    adaptive_k, adaptive_model = _adaptive_settings(question, intent, paper_id)
+    k = adaptive_k
+    chat_model = chat_model or adaptive_model
     queries = _expand_queries(question, intent)
     where   = {"paper_id": paper_id} if paper_id else None
 
@@ -229,11 +267,9 @@ def answer_question(
     # Vision augmentation: render PDF pages when asking about figures in a specific paper
     if is_figure_question(question) and paper_id and pdf_dir:
         pdf_path = Path(pdf_dir) / f"{paper_id}.pdf"
-        print(f"[vision] checking PDF: {pdf_path} exists={pdf_path.exists()}")
         if not pdf_path.exists():
             matches = sorted(Path(pdf_dir).glob(f"{paper_id}*.pdf"))
             pdf_path = matches[0] if matches else None
-            print(f"[vision] glob fallback: {pdf_path}")
 
         if pdf_path and pdf_path.exists():
             retrieved_pages = [h["meta"]["page"] for h in all_hits[:6]]
@@ -244,7 +280,6 @@ def answer_question(
                 img for p in pages_to_render
                 if (img := render_page_as_base64(str(pdf_path), p)) is not None
             ]
-            print(f"[vision] pages={pages_to_render} images_rendered={len(images)}")
             if images:
                 try:
                     # Supplement with database data for this paper if count is asked
