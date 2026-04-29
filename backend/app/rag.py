@@ -9,10 +9,12 @@ Improvements over the original:
 - Source deduplication: unique paper+page pairs only
 """
 
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from .vectorstore import VectorStore
 from .ollama_client import OllamaClient
+from .vision import is_figure_question, get_pages_for_question, render_page_as_base64
 
 
 # ── Intent detection ─────────────────────────────────────────────────────────
@@ -177,6 +179,7 @@ def answer_question(
     k: int = 8,
     paper_id: Optional[str] = None,
     chat_model: Optional[str] = None,
+    pdf_dir: Optional[str] = None,
 ) -> dict:
     intent = _detect_intent(question)
     queries = _expand_queries(question, intent)
@@ -222,6 +225,41 @@ def answer_question(
         }
 
     llm = OllamaClient(env_path=env_path)
+
+    # Vision augmentation: render PDF pages when asking about figures in a specific paper
+    if is_figure_question(question) and paper_id and pdf_dir:
+        pdf_path = Path(pdf_dir) / f"{paper_id}.pdf"
+        if not pdf_path.exists():
+            matches = sorted(Path(pdf_dir).glob(f"{paper_id}*.pdf"))
+            pdf_path = matches[0] if matches else None
+
+        if pdf_path and pdf_path.exists():
+            retrieved_pages = [h["meta"]["page"] for h in all_hits[:6]]
+            pages_to_render = get_pages_for_question(
+                str(pdf_path), question, retrieved_pages
+            )
+            images = [
+                img for p in pages_to_render
+                if (img := render_page_as_base64(str(pdf_path), p)) is not None
+            ]
+            if images:
+                try:
+                    answer = llm.vision_chat(
+                        question=question,
+                        images_b64=images,
+                        context=context[:3000],
+                        think=False,
+                        timeout=120,
+                    )
+                    return {
+                        "answer":  answer,
+                        "sources": _dedup_sources(all_hits),
+                        "intent":  intent,
+                        "mode":    "vision",
+                    }
+                except Exception as e:
+                    print(f"[vision] failed, falling back to RAG: {e}")
+
     messages = [
         {"role": "system", "content": _build_system_prompt(intent)},
         {"role": "user",   "content": f"Question:\n{question}\n\nEvidence excerpts:\n{context}"},

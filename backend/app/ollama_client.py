@@ -101,6 +101,31 @@ class OllamaClient:
                 raise
         raise RuntimeError(f"Chat failed after {max_retries} retries")
 
+    def vision_chat(self, question: str, images_b64: List[str],
+                    context: str = "", think: bool = False,
+                    timeout: int = 120) -> str:
+        vision_model = os.getenv("OLLAMA_VISION_MODEL", "gemma4:latest")
+        content = question
+        if context:
+            content = f"Context from paper text:\n{context}\n\nQuestion: {question}"
+        payload = {
+            "model": vision_model,
+            "messages": [{"role": "user", "content": content, "images": images_b64}],
+            "think": think,
+            "stream": False,
+        }
+        r = requests.post(
+            f"{self.api_url}/api/chat",
+            headers=self.headers,
+            json=payload,
+            timeout=timeout,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"Vision chat error {r.status_code}: {r.text}")
+        if not r.text.strip():
+            raise RuntimeError("Empty response from vision model")
+        return r.json()["message"]["content"]
+
     # Known embedding-only model name fragments to exclude from chat model list
     _EMBED_KEYWORDS = (
         "embed", "minilm", "bge", "e5-", "arctic-embed",

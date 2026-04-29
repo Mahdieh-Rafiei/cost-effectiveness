@@ -166,6 +166,7 @@ def ask(req: AskRequest):
         k=req.top_k,
         paper_id=req.paper_id,
         chat_model=_chat_model,
+        pdf_dir=str(PDF_DIR),
     )
 
 
