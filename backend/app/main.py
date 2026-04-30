@@ -309,6 +309,11 @@ def validate_table1():
     No separate startup event needed — always fresh, always correct.
     """
     import sqlite3 as _sqlite3
+    import unicodedata as _ud
+
+    def _norm(s: str) -> str:
+        """Normalize unicode to ASCII for fuzzy matching (ü→u, ø→o, ö→o)."""
+        return _ud.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
 
     conn = _sqlite3.connect(str(DATA_DIR / "ce_studies.sqlite3"))
     conn.row_factory = _sqlite3.Row
@@ -318,6 +323,7 @@ def validate_table1():
         r["paper_id"]
         for r in conn.execute("SELECT DISTINCT paper_id FROM ce_comparisons").fetchall()
     ]
+    norm_pids = {p: _norm(p) for p in all_pids}
 
     update_fields = ["body_region", "condition", "country", "study_design",
                      "perspective", "outcome_measure", "outcome_type", "time_horizon"]
@@ -327,14 +333,14 @@ def validate_table1():
     unmatched = []
 
     for corr in TABLE1_CORRECTIONS:
-        author_key = corr["a"].lower().split()[0]
+        author_key = _norm(corr["a"].split()[0])  # normalize author too
         year = corr["y"]
         matches = [
-            p for p in all_pids
-            if author_key in p.lower() and year in p and p not in applied
+            p for p, np in norm_pids.items()
+            if author_key in np and year in np and p not in applied
         ]
         if len(matches) > 1:
-            strict = [m for m in matches if m.lower().startswith(author_key)]
+            strict = [m for m in matches if norm_pids[m].startswith(author_key)]
             if strict:
                 matches = strict
         if not matches:

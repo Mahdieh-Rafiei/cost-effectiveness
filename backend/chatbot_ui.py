@@ -449,8 +449,8 @@ CROSS_KW = [
     # CE outcomes
     "dominant", "dominated", "quadrant", "cost-effective", "cost effective",
     "icer", "cost-effectiveness plane",
-    # Extraction / validation
-    "table 1", "table 2", "table2", "correctly extracted", "extraction correct",
+    # Extraction / validation (table 1/2 removed — handled by _is_validate path)
+    "correctly extracted", "extraction correct",
     "is it correct", "are these correct", "did you extract", "is the content",
     "do you agree", "agree with", "placement", "location of", "correctly placed",
     # Cross-study patterns
@@ -595,6 +595,38 @@ if user_q:
         )
 
         answer = ""
+
+        # ── Table 2 coverage question ────────────────────────────────────────
+        _TABLE2_KW = {"table 2 coverage", "table2 coverage", "coverage of table 2",
+                      "table 2 extraction", "what is the table 2", "show table 2 coverage",
+                      "intervention coverage", "frequency coverage", "sessions coverage",
+                      "icer coverage", "table 2 fields"}
+        _is_table2_q = any(k in q_lower for k in _TABLE2_KW)
+
+        if _is_table2_q and _is_review_selected:
+            qv = _get("/quick_validate")
+            t2 = qv.get("table2_fields", {})
+            total = qv.get("total_papers", 0)
+            avg2 = qv.get("table2_avg_coverage_pct", 0)
+
+            def _bar2(pct):
+                filled = round(pct / 10)
+                return "█" * filled + "░" * (10 - filled) + f" {pct}%"
+
+            t2_rows = "\n".join(
+                f"| {k.replace('_', ' ').title()} | {_bar2(v['pct'])} | {v['extracted']}/{total} |"
+                for k, v in t2.items()
+            )
+            answer = (
+                f"**Table 2 — Intervention details coverage across {total} papers** (avg: {avg2}%)\n\n"
+                f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}\n\n"
+                f"_Table 2 fields (frequency, sessions, duration, supervision, ICER) come from LLM extraction "
+                f"of individual PDFs — they are harder to automate than Table 1. "
+                f"Fields below 30% need a targeted re-extraction pass._"
+            )
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.stop()
 
         if _is_validate and active_paper_id and not use_compare:
             if _is_review_selected:
