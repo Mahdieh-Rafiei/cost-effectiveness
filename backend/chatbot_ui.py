@@ -528,6 +528,22 @@ if user_q:
         "review of trial" in active_paper_id.lower()
     )
 
+    # "Fix extractions" / "rebuild" triggers re-extraction of failed papers
+    _REBUILD_KW = {"fix extraction", "fix the extraction", "rebuild extraction",
+                   "re-extract", "reextract", "fix incorrect", "improve extraction"}
+    if any(k in q_lower for k in _REBUILD_KW):
+        _post("/rebuild_failed", {})
+        answer = (
+            "Re-extraction started for all papers with incorrect/partial extractions. "
+            "This uses the systematic review to fill in missing fields (body region, ICER, intervention, etc.). "
+            "Takes ~5-10 minutes. When done, the data quality will be much better — "
+            "ask 'Is the content of Tables 1 and 2 correctly extracted?' to see the results."
+        )
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.stop()
+
     # "Run deep validation" explicitly triggers background LLM validation
     if "run deep validation" in q_lower and _is_review_selected:
         _post("/batch_validate", {})
@@ -590,6 +606,13 @@ if user_q:
                     f"**Table 2 — Intervention details** (avg: {avg2}%)\n"
                     f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}\n\n"
                 )
+
+                # Add re-extraction progress if running
+                rebuild_status = _get("/rebuild_failed_status")
+                if rebuild_status.get("running"):
+                    rb_done = rebuild_status.get("done", 0)
+                    rb_total = rebuild_status.get("total", 0)
+                    answer += f"\n\n_Re-extraction in progress: {rb_done}/{rb_total} papers fixed…_"
 
                 # Add LLM validation status
                 status = _get("/batch_validate_status")

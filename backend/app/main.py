@@ -45,7 +45,7 @@ from .pdf_extract import extract_pdf_pages
 from .chunking import make_chunks
 from .vectorstore import VectorStore
 from .rag import answer_question, answer_question_stream
-from .ce_build import build_ce_table, rebuild_unclear_papers
+from .ce_build import build_ce_table, rebuild_unclear_papers, rebuild_failed_papers, get_rebuild_failed_progress
 from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
 from .vision import (is_figure_question, get_pages_for_question,
@@ -230,6 +230,30 @@ def build_ce():
 def rebuild_unclear():
     """Second-pass extraction for papers still marked unclear quadrant."""
     return rebuild_unclear_papers(store=store, env_path=ENV_PATH)
+
+
+@app.post("/rebuild_failed")
+def rebuild_failed():
+    """
+    Re-extract papers marked incorrect/partial in validation report.
+    Uses enhanced context (paper + SR chunks) to fix 'unknown' field problem.
+    Runs in background — check /rebuild_failed_status for progress.
+    """
+    progress = get_rebuild_failed_progress()
+    if progress.get("running"):
+        return {"status": "already_running", **progress}
+    threading.Thread(
+        target=rebuild_failed_papers,
+        kwargs={"store": store, "env_path": ENV_PATH, "report_path": str(VALIDATION_REPORT_PATH)},
+        daemon=True,
+    ).start()
+    return {"status": "started", "message": "Re-extraction running in background."}
+
+
+@app.get("/rebuild_failed_status")
+def rebuild_failed_status():
+    """Check re-extraction progress."""
+    return get_rebuild_failed_progress()
 
 
 @app.get("/paper_info")

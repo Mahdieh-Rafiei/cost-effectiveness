@@ -8,6 +8,7 @@ Strategy per paper:
   4. Persist each row into ce_comparisons via upsert_comparison().
 """
 
+import re
 import time
 from pathlib import Path
 from typing import List, Dict, Any
@@ -231,3 +232,151 @@ def rebuild_unclear_papers(store: VectorStore, env_path: str) -> Dict[str, Any]:
 def build_ce_table(store: VectorStore, env_path: str, pdf_dir: str) -> Dict[str, Any]:
     """Alias for build_comparisons (used by old /build_ce_table endpoint)."""
     return build_comparisons(store=store, env_path=env_path, pdf_dir=pdf_dir)
+
+
+# ── Enhanced context: paper + systematic review chunks ────────────────────────
+
+def _gather_enhanced_context(store: VectorStore, paper_id: str) -> str:
+    """
+    Build extraction context using BOTH the paper's own chunks AND
+    the systematic review's text about this paper (identified by author+year).
+    This dramatically improves extraction for papers where the individual text
+    chunks lacked explicit CE details.
+    """
+    base_context = _gather_context(store, paper_id)
+
+    # Extract author and year from paper_id (format: "Author-YEAR-...")
+    parts = paper_id.split("-", 2)
+    author = parts[0].strip() if parts else ""
+    year_m = re.search(r'\b(19|20)\d{2}\b', paper_id)
+    year = year_m.group(0) if year_m else ""
+
+    if not (author and year):
+        return base_context
+
+    # Find the systematic review paper
+    sr_rows = query_sql(
+        "SELECT DISTINCT paper_id FROM ce_comparisons "
+        "WHERE lower(paper_id) LIKE '%systematic review%' "
+        "   OR lower(paper_id) LIKE '%review of trial%'", ()
+    )
+    if not sr_rows:
+        return base_context
+
+    sr_id = sr_rows[0]["paper_id"]
+    try:
+        sr_hits = store.query(
+            f"{author} {year} physiotherapy cost-effectiveness ICER "
+            f"intervention comparator body region perspective time horizon",
+            k=8, where={"paper_id": sr_id},
+        )
+        if sr_hits:
+            sr_text = "\n\n".join(
+                f"[Systematic Review p.{h['meta']['page']}] {h['text']}"
+                for h in sr_hits
+            )
+            return (
+                f"=== SYSTEMATIC REVIEW SUMMARY FOR THIS PAPER ===\n"
+                f"{sr_text}\n\n"
+                f"=== ORIGINAL PAPER TEXT ===\n"
+                f"{base_context}"
+            )
+    except Exception:
+        pass
+
+    return base_context
+
+
+# ── Re-extract papers flagged as incorrect/partial in validation ───────────────
+
+_rebuild_failed_progress: Dict[str, Any] = {
+    "running": False, "done": 0, "total": 0, "errors": 0
+}
+
+
+def rebuild_failed_papers(
+    store: VectorStore,
+    env_path: str,
+    report_path: str,
+) -> Dict[str, Any]:
+    """
+    Re-extract CE data for papers flagged as incorrect/partial/cannot_verify
+    in the validation report. Uses enhanced context (paper + SR) to fix the
+    'unknown' field problem.
+    """
+    global _rebuild_failed_progress
+    import json as _json
+
+    rp = Path(report_path)
+    if not rp.exists():
+        return {"error": "No validation report found. Run /batch_validate first."}
+
+    report = _json.loads(rp.read_text())
+    results = report.get("results", [])
+
+    failing = [
+        r for r in results
+        if r.get("overall") in ("incorrect", "partial", "cannot_verify")
+    ]
+    paper_ids = [r["paper_id"] for r in failing]
+
+    if not paper_ids:
+        return {"status": "ok", "message": "No failing papers to re-extract.", "updated": 0}
+
+    _rebuild_failed_progress = {
+        "running": True, "done": 0, "total": len(paper_ids), "errors": 0
+    }
+
+    updated = 0
+    errors_count = 0
+
+    for paper_id in paper_ids:
+        print(f"[REBUILD_FAILED] {paper_id}")
+        try:
+            context = _gather_enhanced_context(store, paper_id)
+            if not context.strip():
+                print(f"  ⚠ No context found")
+                errors_count += 1
+                _rebuild_failed_progress["done"] += 1
+                _rebuild_failed_progress["errors"] += 1
+                continue
+
+            comparisons = extract_comparisons(
+                paper_id=paper_id,
+                context=context,
+                env_path=env_path,
+            )
+
+            # Delete old rows for this paper then re-insert
+            conn = get_conn()
+            conn.execute("DELETE FROM ce_comparisons WHERE paper_id = ?", (paper_id,))
+            conn.commit()
+            conn.close()
+
+            for comp in comparisons:
+                upsert_comparison(comp)
+
+            n = len(comparisons)
+            print(f"  ✓ {n} comparison(s) re-extracted")
+            updated += 1
+            time.sleep(3)
+
+        except Exception as e:
+            print(f"  ✗ ERROR: {e}")
+            errors_count += 1
+            _rebuild_failed_progress["errors"] += 1
+
+        _rebuild_failed_progress["done"] += 1
+
+    _rebuild_failed_progress["running"] = False
+
+    return {
+        "status": "ok",
+        "total_failing": len(paper_ids),
+        "re_extracted": updated,
+        "errors": errors_count,
+    }
+
+
+def get_rebuild_failed_progress() -> Dict[str, Any]:
+    return dict(_rebuild_failed_progress)
