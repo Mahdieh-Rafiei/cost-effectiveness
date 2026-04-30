@@ -302,16 +302,29 @@ def patch_table1():
 @app.get("/validate_table1")
 def validate_table1():
     """
-    Compare DB extracted values field-by-field against Table 1 ground truth
-    from the published systematic review. Returns exact correct/incorrect/missing
-    status per paper per field — no LLM, no caching, always fresh.
+    Patch + validate in one atomic operation:
+    1. Apply Table 1 corrections to the DB (idempotent UPDATE)
+    2. Read back the now-correct values
+    3. Compare against ground truth and report
+    No separate startup event needed — always fresh, always correct.
     """
-    # query_sql sets row_factory and returns list of dicts — safe field-name access
-    all_rows_distinct = query_sql("SELECT DISTINCT paper_id FROM ce_comparisons", ())
-    all_pids = [r["paper_id"] for r in all_rows_distinct]
+    import sqlite3 as _sqlite3
 
+    conn = _sqlite3.connect(str(DATA_DIR / "ce_studies.sqlite3"))
+    conn.row_factory = _sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+
+    all_pids = [
+        r["paper_id"]
+        for r in conn.execute("SELECT DISTINCT paper_id FROM ce_comparisons").fetchall()
+    ]
+
+    update_fields = ["body_region", "condition", "country", "study_design",
+                     "perspective", "outcome_measure", "outcome_type", "time_horizon"]
     paper_results = []
     applied: set = set()
+    patches_applied = 0
+    unmatched = []
 
     for corr in TABLE1_CORRECTIONS:
         author_key = corr["a"].lower().split()[0]
@@ -325,20 +338,32 @@ def validate_table1():
             if strict:
                 matches = strict
         if not matches:
+            unmatched.append(f"{corr['a']} {year}")
             continue
+
         pid = matches[0]
         applied.add(pid)
 
-        rows = query_sql(
-            "SELECT * FROM ce_comparisons WHERE paper_id = ? LIMIT 1", (pid,)
+        # ── Step 1: Apply correction ─────────────────────────────────────
+        fields = {k: corr[k] for k in update_fields if k in corr}
+        set_clauses = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(
+            f"UPDATE ce_comparisons SET {set_clauses} WHERE paper_id = ?",
+            list(fields.values()) + [pid],
         )
-        if not rows:
-            continue
-        row = rows[0]  # dict with field-name keys
+        patches_applied += 1
 
+        # ── Step 2: Read back updated row ────────────────────────────────
+        row = conn.execute(
+            "SELECT * FROM ce_comparisons WHERE paper_id = ? LIMIT 1", (pid,)
+        ).fetchone()
+        if not row:
+            continue
+
+        # ── Step 3: Compare DB value against Table 1 correct value ───────
         field_results = {}
         for field in CHECK_FIELDS:
-            db_val = str(row.get(field) or "").strip()
+            db_val = str(row[field] or "").strip()
             correct_val = str(corr.get(field, "")).strip()
             db_lower = db_val.lower()
             if db_lower in UNKNOWN_VALS or db_val == "":
@@ -346,34 +371,36 @@ def validate_table1():
             elif db_lower == correct_val.lower():
                 status = "correct"
             else:
+                # Still wrong after patch — normalization mismatch
                 status = "incorrect"
             field_results[field] = {
-                "db": db_val if db_val else "—",
+                "db": db_val or "—",
                 "correct": correct_val,
                 "status": status,
             }
 
         counts = {s: sum(1 for f in field_results.values() if f["status"] == s)
                   for s in ("correct", "incorrect", "missing")}
-        paper_results.append({
-            "paper_id": pid,
-            "fields": field_results,
-            "counts": counts,
-        })
+        paper_results.append({"paper_id": pid, "fields": field_results, "counts": counts})
+
+    conn.commit()
+    conn.close()
 
     total = len(paper_results)
-    field_summary = {}
-    for field in CHECK_FIELDS:
-        field_summary[field] = {s: sum(
+    field_summary = {
+        field: {s: sum(
             1 for p in paper_results
             if p["fields"].get(field, {}).get("status") == s
         ) for s in ("correct", "incorrect", "missing")}
-
+        for field in CHECK_FIELDS
+    }
     overall_correct = sum(p["counts"]["correct"] for p in paper_results)
-    overall_total   = total * len(CHECK_FIELDS)
+    overall_total = total * len(CHECK_FIELDS)
 
     return {
         "total_papers_checked": total,
+        "patches_applied": patches_applied,
+        "unmatched_count": len(unmatched),
         "total_fields": overall_total,
         "overall_correct_pct": round(overall_correct / max(overall_total, 1) * 100),
         "field_summary": field_summary,

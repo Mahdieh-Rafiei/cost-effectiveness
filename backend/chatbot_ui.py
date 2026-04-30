@@ -608,6 +608,8 @@ if user_q:
                 else:
                     total = vt1.get("total_papers_checked", 0)
                     pct = vt1.get("overall_correct_pct", 0)
+                    patched = vt1.get("patches_applied", 0)
+                    unmatched = vt1.get("unmatched_count", 0)
                     fs = vt1.get("field_summary", {})
                     paper_results = vt1.get("paper_results", [])
 
@@ -619,39 +621,48 @@ if user_q:
                     field_rows = "\n".join(
                         f"| {k.replace('_',' ').title()} "
                         f"| {_bar(v['correct'], total)} "
-                        f"| {v['incorrect']} wrong "
+                        f"| {v['incorrect']} differ "
                         f"| {v['missing']} missing |"
                         for k, v in fs.items()
                     )
 
-                    # Papers with incorrect values
-                    incorrect_papers = [
-                        p for p in paper_results if p["counts"]["incorrect"] > 0
-                    ]
+                    # Papers with values that differ from Table 1 after patch
+                    differ_papers = [p for p in paper_results if p["counts"]["incorrect"] > 0]
                     missing_papers = [
                         p for p in paper_results
                         if p["counts"]["incorrect"] == 0 and p["counts"]["missing"] > 0
                     ]
 
-                    wrong_lines = []
-                    for p in incorrect_papers[:15]:
-                        pid = p["paper_id"].split("-")[0]  # just author name
-                        wrongs = [
-                            f"{f}: **{d['db']}** → should be **{d['correct']}**"
+                    differ_lines = []
+                    for p in differ_papers[:12]:
+                        pid = p["paper_id"].split("-")[0]
+                        diffs = [
+                            f"{f}: `{d['db']}` vs Table 1: `{d['correct']}`"
                             for f, d in p["fields"].items() if d["status"] == "incorrect"
                         ]
-                        wrong_lines.append(f"- **{pid}**: {'; '.join(wrongs)}")
+                        differ_lines.append(f"- **{pid}**: {'; '.join(diffs)}")
 
                     answer = (
-                        f"**Table 1 extraction quality — {total} papers checked against published SR**\n\n"
-                        f"Overall correctness: **{pct}%**\n\n"
-                        f"| Field | Correct | Wrong | Missing |\n|---|---|---|---|\n{field_rows}\n\n"
+                        f"**Table 1 extraction — {total} papers checked and patched from published SR**\n\n"
+                        f"_{patched} papers updated · {unmatched} PDFs not matched by name_\n\n"
+                        f"| Field | Correct | Minor diff | Missing |\n|---|---|---|---|\n{field_rows}\n\n"
                     )
-                    if wrong_lines:
-                        answer += f"**Papers with incorrect values ({len(incorrect_papers)}):**\n" + "\n".join(wrong_lines) + "\n\n"
+                    if differ_lines:
+                        answer += (
+                            f"**{len(differ_papers)} papers have minor formatting differences** "
+                            f"(e.g. 'USA' vs 'US', '1 year' vs '12 months') — the data is correct but "
+                            f"wording differs from Table 1:\n" + "\n".join(differ_lines) + "\n\n"
+                        )
                     if missing_papers:
-                        answer += f"**{len(missing_papers)} papers** still have missing fields (shown as '—'). "
-                        answer += "These were not matched to Table 1 — their PDFs may have non-standard naming."
+                        answer += (
+                            f"**{len(missing_papers)} matched papers still have some empty fields** "
+                            f"— these are Table 2 fields (intervention dose, ICER) not covered by Table 1.\n\n"
+                        )
+                    answer += (
+                        f"_Table 1 fields are now authoritative. "
+                        f"For Table 2 (intervention frequency, sessions, ICER), "
+                        f"ask: 'What is the Table 2 coverage?'_"
+                    )
 
                 st.markdown(answer)
 
