@@ -306,7 +306,7 @@ with st.sidebar:
     top_k = st.slider("Chunks retrieved (RAG)", 4, 60, 12,
                       help="More chunks = more context, slower")
 
-    # ── Paper metadata card ───────────────────────────────────────────────────
+    # ── Paper metadata card (info only, no buttons) ───────────────────────────
     if mode == "Single-paper" and st.session_state.get("selected_paper"):
         pid = st.session_state.selected_paper
         info = _get("/paper_info", params={"paper_id": pid})
@@ -343,86 +343,33 @@ with st.sidebar:
             if icer and icer != "unknown":
                 meta_lines.append(f"**ICER:** {icer if isinstance(icer, str) else icer[0]}")
             meta_lines.append(f"**Quadrant:** {quad_display}")
-
             st.markdown("\n\n".join(meta_lines))
 
-            # ── Suggested questions ───────────────────────────────────────────
+            # Suggested questions (display only)
             st.markdown("---")
-            st.markdown("**💡 Suggested questions**")
+            st.markdown("**💡 Try asking:**")
             region = info.get("body_region", "unknown").replace("_", " ")
             interv = info.get("intervention_type", "unknown").replace("_", " ")
             quad   = quadrants[0] if quadrants else "unclear"
+            _is_review = ("systematic review" in pid.lower() or "review of trial" in pid.lower())
 
-            suggestions = [
-                "What is the main cost-effectiveness finding of this study?",
-                f"How was the {interv} intervention delivered — frequency, sessions, duration?" if interv != "unknown" else "How was the intervention delivered?",
-            ]
-            if region != "unknown":
-                suggestions.append(f"What outcome measures were used for {region}?")
-            if quad == "dominant":
-                suggestions.append("Why was this intervention considered dominant (cost-saving and more effective)?")
-            elif quad == "NE":
-                suggestions.append("What willingness-to-pay threshold was used and is the ICER acceptable?")
-            elif quad == "dominated":
-                suggestions.append("Why was this intervention not cost-effective?")
+            if _is_review:
+                suggestions = [
+                    "What does Figure 4 show and how many comparisons are dominant?",
+                    "Is the content of Tables 1 and 2 correctly extracted?",
+                    "Why do Fig 4 and Fig 5 have different quadrant distributions?",
+                    "Which body regions have the most cost-effective interventions?",
+                ]
             else:
-                suggestions.append("What was the ICER value and is the intervention cost-effective?")
+                suggestions = [
+                    "What is the main cost-effectiveness finding of this study?",
+                    f"How was the {interv} intervention delivered?" if interv != "unknown" else "How was the intervention delivered?",
+                    f"What outcome measures were used?" if region == "unknown" else f"What outcome measures were used for {region}?",
+                    "Why was this intervention cost-effective?" if quad == "dominant" else "What was the ICER value?",
+                ]
 
             for sq in suggestions[:4]:
                 st.markdown(f'<div class="example-q">💬 {sq}</div>', unsafe_allow_html=True)
-
-            # ── Validate vs systematic review ─────────────────────────────────
-            st.markdown("---")
-
-            _is_review = ("systematic review" in pid.lower() or
-                          "review of trial" in pid.lower())
-
-            if _is_review:
-                # Batch validate all papers
-                st.markdown("**🔬 Batch validation**")
-                status = _get("/batch_validate_status")
-                if status.get("running"):
-                    done = status.get("done", 0)
-                    total = status.get("total", 0)
-                    st.info(f"Running… {done}/{total} papers validated")
-                else:
-                    if st.button("▶️ Validate all 78 papers vs. review",
-                                 use_container_width=True,
-                                 help="~15 min. Saves report to server."):
-                        st.info("Started! Check back in ~15 minutes.")
-                        import threading
-                        threading.Thread(
-                            target=lambda: _post("/batch_validate", {}),
-                            daemon=True,
-                        ).start()
-
-                # Download existing report
-                report = _get("/batch_validate_report")
-                if "error" not in report:
-                    summary = report.get("summary", {})
-                    st.markdown(
-                        f"Last report: ✅ {summary.get('correct',0)} correct · "
-                        f"⚠️ {summary.get('partial',0)} partial · "
-                        f"❌ {summary.get('incorrect',0)} incorrect"
-                    )
-                    st.download_button(
-                        "⬇️ Download validation report (JSON)",
-                        data=json.dumps(report, indent=2),
-                        file_name="validation_report.json",
-                        mime="application/json",
-                        use_container_width=True,
-                    )
-            else:
-                if st.button("🔍 Validate vs. systematic review",
-                             use_container_width=True,
-                             help="Check if the systematic review correctly represents this paper"):
-                    with st.spinner("Cross-checking with systematic review…"):
-                        val = _get(f"/validate_vs_review/{pid}")
-                    if "error" in val:
-                        st.error(val["error"])
-                    else:
-                        st.markdown("**Validation result:**")
-                        st.markdown(val.get("validation", "No result."))
 
     st.markdown("---")
 
@@ -566,6 +513,19 @@ if user_q:
         st.session_state.messages.append({"role": "assistant", "content": clarify})
         st.stop()
 
+    # Detect validation intent — route to validation endpoint, not vision
+    _VALIDATE_KW = {
+        "correctly extracted", "is correct", "are these correct",
+        "is it correct", "correctly represented", "validate",
+        "agree with the", "do you agree", "is the content",
+        "correctly placed", "extraction correct",
+    }
+    _is_validate = any(k in q_lower for k in _VALIDATE_KW)
+    _is_review_selected = active_paper_id and (
+        "systematic review" in active_paper_id.lower() or
+        "review of trial" in active_paper_id.lower()
+    )
+
     if mode == "Cross-paper":
         use_compare = True
     elif mode in ("Single-paper", "Compare papers"):
@@ -585,7 +545,18 @@ if user_q:
 
         answer = ""
 
-        if mode == "Compare papers":
+        if _is_validate and active_paper_id and not use_compare:
+            # Validation question: compare DB vs source evidence
+            with st.spinner("Validating extraction…"):
+                if _is_review_selected:
+                    val = _get("/validate_extraction/" + active_paper_id)
+                    answer = val.get("llm_verdict", val.get("error", "Could not validate."))
+                else:
+                    val = _get(f"/validate_vs_review/{active_paper_id}")
+                    answer = val.get("validation", val.get("error", "Could not validate."))
+            st.markdown(answer)
+
+        elif mode == "Compare papers":
             if not active_paper_id or not st.session_state.paper_b:
                 answer = "Please select both Paper A and Paper B in the sidebar."
                 st.markdown(answer)
