@@ -55,6 +55,7 @@ ENV_PATH = os.getenv("ENV_PATH", str(_default_env) if _default_env.exists() else
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 CHROMA_DIR = DATA_DIR / "chroma"
+VALIDATION_REPORT_PATH = DATA_DIR / "validation_report.json"
 
 app = FastAPI(title="Cost-Effectiveness Physiotherapy RAG")
 store = VectorStore(persist_dir=str(CHROMA_DIR), env_path=ENV_PATH, collection_name="papers")
@@ -1204,6 +1205,151 @@ def validate_vs_review(paper_id: str):
         "sr_paper":   sr_id,
         "validation": verdict,
     }
+
+
+# ── Batch validation of all papers against the systematic review ──────────────
+
+_batch_validate_progress: dict = {"running": False, "done": 0, "total": 0, "errors": 0}
+
+
+@app.post("/batch_validate")
+def batch_validate():
+    """
+    Validate ALL individual papers against the systematic review.
+    Saves results to data/validation_report.json.
+    Returns immediately if already running.
+    """
+    global _batch_validate_progress
+    if _batch_validate_progress["running"]:
+        return {"status": "already_running", **_batch_validate_progress}
+
+    import re as _re
+
+    # Find SR paper
+    sr_rows = query_sql(
+        "SELECT DISTINCT paper_id FROM ce_comparisons "
+        "WHERE lower(paper_id) LIKE '%systematic review%' "
+        "   OR lower(paper_id) LIKE '%review of trial%'", ()
+    )
+    if not sr_rows:
+        return {"error": "Systematic review paper not found in database."}
+    sr_id = sr_rows[0]["paper_id"]
+
+    # All other papers
+    all_rows = query_sql("SELECT DISTINCT paper_id FROM ce_comparisons", ())
+    paper_ids = [r["paper_id"] for r in all_rows if r["paper_id"] != sr_id]
+
+    _batch_validate_progress = {
+        "running": True, "done": 0, "total": len(paper_ids), "errors": 0
+    }
+
+    llm = OllamaClient(env_path=ENV_PATH)
+    results = []
+
+    for pid in paper_ids:
+        print(f"[BATCH_VALIDATE] {pid}")
+        try:
+            parts = pid.split("-", 2)
+            author = parts[0].strip() if parts else ""
+            year_m = _re.search(r'\b(19|20)\d{2}\b', pid)
+            year = year_m.group(0) if year_m else ""
+
+            sr_hits = store.query(
+                f"{author} {year} cost-effectiveness ICER intervention",
+                k=6, where={"paper_id": sr_id},
+            )
+            sr_ctx = "\n".join(f"[SR p.{h['meta']['page']}] {h['text']}" for h in sr_hits)
+
+            paper_hits = store.query(
+                "cost-effectiveness ICER intervention comparator study design",
+                k=6, where={"paper_id": pid},
+            )
+            paper_ctx = "\n".join(f"[p.{h['meta']['page']}] {h['text']}" for h in paper_hits)
+
+            db_rows = query_sql("SELECT * FROM ce_comparisons WHERE paper_id = ?", (pid,))
+            db = {}
+            if db_rows:
+                r = db_rows[0]
+                db = {k: r.get(k) for k in [
+                    "body_region", "intervention_type", "comparator_type",
+                    "icer", "quadrant", "ce_conclusion", "time_horizon", "perspective",
+                ]}
+
+            messages = [
+                {"role": "system", "content": (
+                    "You are validating a systematic review entry for one study. "
+                    "Reply in JSON only:\n"
+                    '{"overall": "correct|partial|incorrect|cannot_verify", '
+                    '"fields": {"body_region":"correct|incorrect|cannot_verify", '
+                    '"intervention":"correct|incorrect|cannot_verify", '
+                    '"comparator":"correct|incorrect|cannot_verify", '
+                    '"icer":"correct|incorrect|cannot_verify", '
+                    '"quadrant":"correct|incorrect|cannot_verify"}, '
+                    '"issues": ["list of specific errors found"], '
+                    '"note": "one sentence summary"}'
+                )},
+                {"role": "user", "content": (
+                    f"Paper: {pid} (Author: {author}, Year: {year})\n\n"
+                    f"Systematic review text:\n{sr_ctx}\n\n"
+                    f"Original paper text:\n{paper_ctx}\n\n"
+                    f"Database extraction:\n{json.dumps(db)}"
+                )},
+            ]
+
+            raw = llm.chat(messages, temperature=0.0, model=_chat_model, timeout=120)
+
+            # Parse JSON from response
+            try:
+                start = raw.find("{")
+                end = raw.rfind("}") + 1
+                verdict = json.loads(raw[start:end]) if start >= 0 else {"overall": "cannot_verify", "note": raw[:200]}
+            except Exception:
+                verdict = {"overall": "cannot_verify", "note": raw[:200]}
+
+            results.append({"paper_id": pid, "author": author, "year": year, **verdict})
+            _batch_validate_progress["done"] += 1
+
+        except Exception as e:
+            print(f"  ✗ {e}")
+            results.append({"paper_id": pid, "overall": "error", "note": str(e)})
+            _batch_validate_progress["errors"] += 1
+            _batch_validate_progress["done"] += 1
+
+        import time as _time
+        _time.sleep(3)
+
+    # Aggregate summary
+    counts = {}
+    for r in results:
+        v = r.get("overall", "unknown")
+        counts[v] = counts.get(v, 0) + 1
+
+    report = {
+        "total_papers": len(paper_ids),
+        "summary": counts,
+        "results": results,
+    }
+
+    VALIDATION_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    VALIDATION_REPORT_PATH.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+
+    _batch_validate_progress["running"] = False
+    print(f"[BATCH_VALIDATE] Done. Summary: {counts}")
+    return {"status": "ok", **report}
+
+
+@app.get("/batch_validate_status")
+def batch_validate_status():
+    """Check batch validation progress."""
+    return _batch_validate_progress
+
+
+@app.get("/batch_validate_report")
+def batch_validate_report():
+    """Return saved validation report."""
+    if not VALIDATION_REPORT_PATH.exists():
+        return {"error": "No report found. Run /batch_validate first."}
+    return json.loads(VALIDATION_REPORT_PATH.read_text())
 
 
 # ── 2. Review Fig 5 placements ────────────────────────────────────────────────

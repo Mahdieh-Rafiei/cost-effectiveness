@@ -373,16 +373,56 @@ with st.sidebar:
 
             # ── Validate vs systematic review ─────────────────────────────────
             st.markdown("---")
-            if st.button("🔍 Validate vs. systematic review",
-                         use_container_width=True,
-                         help="Check if the systematic review correctly represents this paper"):
-                with st.spinner("Cross-checking with systematic review…"):
-                    val = _get(f"/validate_vs_review/{pid}")
-                if "error" in val:
-                    st.error(val["error"])
+
+            _is_review = ("systematic review" in pid.lower() or
+                          "review of trial" in pid.lower())
+
+            if _is_review:
+                # Batch validate all papers
+                st.markdown("**🔬 Batch validation**")
+                status = _get("/batch_validate_status")
+                if status.get("running"):
+                    done = status.get("done", 0)
+                    total = status.get("total", 0)
+                    st.info(f"Running… {done}/{total} papers validated")
                 else:
-                    st.markdown("**Validation result:**")
-                    st.markdown(val.get("validation", "No result."))
+                    if st.button("▶️ Validate all 78 papers vs. review",
+                                 use_container_width=True,
+                                 help="~15 min. Saves report to server."):
+                        st.info("Started! Check back in ~15 minutes.")
+                        import threading
+                        threading.Thread(
+                            target=lambda: _post("/batch_validate", {}),
+                            daemon=True,
+                        ).start()
+
+                # Download existing report
+                report = _get("/batch_validate_report")
+                if "error" not in report:
+                    summary = report.get("summary", {})
+                    st.markdown(
+                        f"Last report: ✅ {summary.get('correct',0)} correct · "
+                        f"⚠️ {summary.get('partial',0)} partial · "
+                        f"❌ {summary.get('incorrect',0)} incorrect"
+                    )
+                    st.download_button(
+                        "⬇️ Download validation report (JSON)",
+                        data=json.dumps(report, indent=2),
+                        file_name="validation_report.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
+            else:
+                if st.button("🔍 Validate vs. systematic review",
+                             use_container_width=True,
+                             help="Check if the systematic review correctly represents this paper"):
+                    with st.spinner("Cross-checking with systematic review…"):
+                        val = _get(f"/validate_vs_review/{pid}")
+                    if "error" in val:
+                        st.error(val["error"])
+                    else:
+                        st.markdown("**Validation result:**")
+                        st.markdown(val.get("validation", "No result."))
 
     st.markdown("---")
 
