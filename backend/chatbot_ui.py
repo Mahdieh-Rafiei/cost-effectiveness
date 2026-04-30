@@ -546,15 +546,63 @@ if user_q:
         answer = ""
 
         if _is_validate and active_paper_id and not use_compare:
-            # Validation question: compare DB vs source evidence
-            with st.spinner("Validating extraction…"):
-                if _is_review_selected:
-                    val = _get("/validate_extraction/" + active_paper_id)
-                    answer = val.get("llm_verdict", val.get("error", "Could not validate."))
+            if _is_review_selected:
+                # User is asking if the SR's tables correctly represent the 78 papers
+                status = _get("/batch_validate_status")
+                report = _get("/batch_validate_report")
+
+                if status.get("running"):
+                    done = status.get("done", 0)
+                    total = status.get("total", 0)
+                    answer = (
+                        f"I'm currently cross-validating all {total} papers against "
+                        f"the systematic review ({done}/{total} done). "
+                        f"Please ask me again in a few minutes."
+                    )
+                    st.markdown(answer)
+
+                elif "error" not in report:
+                    # Report exists — summarise it with the LLM
+                    with st.spinner("Summarising validation report…"):
+                        results = report.get("results", [])
+                        summary = report.get("summary", {})
+                        issues_list = []
+                        for r in results:
+                            for issue in r.get("issues", []):
+                                if issue:
+                                    issues_list.append(
+                                        f"- **{r.get('author','')} {r.get('year','')}**: {issue}"
+                                    )
+                        issues_text = "\n".join(issues_list[:20])
+                        answer = (
+                            f"**Cross-validation of {len(results)} papers against the systematic review:**\n\n"
+                            f"| Verdict | Count |\n|---|---|\n"
+                            + "\n".join(
+                                f"| {k.replace('_',' ').title()} | {v} |"
+                                for k, v in sorted(summary.items(), key=lambda x: -x[1])
+                            )
+                            + (f"\n\n**Main discrepancies found ({min(20,len(issues_list))} shown):**\n{issues_text}" if issues_list else "\n\nNo specific discrepancies recorded.")
+                        )
+                    st.markdown(answer)
+
                 else:
+                    # No report yet — trigger it and explain
+                    _post("/batch_validate", {})
+                    answer = (
+                        "I've started a full cross-validation of all 78 papers against "
+                        "the systematic review. This checks whether Tables 1 and 2 correctly "
+                        "represent each individual study.\n\n"
+                        "This takes about **15 minutes**. Ask me the same question again "
+                        "when it's done and I'll give you the full results."
+                    )
+                    st.markdown(answer)
+
+            else:
+                # Individual paper — validate vs systematic review
+                with st.spinner("Cross-checking with systematic review…"):
                     val = _get(f"/validate_vs_review/{active_paper_id}")
                     answer = val.get("validation", val.get("error", "Could not validate."))
-            st.markdown(answer)
+                st.markdown(answer)
 
         elif mode == "Compare papers":
             if not active_paper_id or not st.session_state.paper_b:

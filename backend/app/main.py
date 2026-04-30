@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 import json
 import os
+import threading
 
 from .pdf_extract import extract_pdf_pages
 from .chunking import make_chunks
@@ -1212,36 +1213,25 @@ def validate_vs_review(paper_id: str):
 _batch_validate_progress: dict = {"running": False, "done": 0, "total": 0, "errors": 0}
 
 
-@app.post("/batch_validate")
-def batch_validate():
-    """
-    Validate ALL individual papers against the systematic review.
-    Saves results to data/validation_report.json.
-    Returns immediately if already running.
-    """
+def _run_batch_validate():
+    """Background worker — validates all papers against the systematic review."""
     global _batch_validate_progress
-    if _batch_validate_progress["running"]:
-        return {"status": "already_running", **_batch_validate_progress}
-
     import re as _re
+    import time as _time
 
-    # Find SR paper
     sr_rows = query_sql(
         "SELECT DISTINCT paper_id FROM ce_comparisons "
         "WHERE lower(paper_id) LIKE '%systematic review%' "
         "   OR lower(paper_id) LIKE '%review of trial%'", ()
     )
     if not sr_rows:
-        return {"error": "Systematic review paper not found in database."}
+        _batch_validate_progress["running"] = False
+        return
     sr_id = sr_rows[0]["paper_id"]
 
-    # All other papers
     all_rows = query_sql("SELECT DISTINCT paper_id FROM ce_comparisons", ())
     paper_ids = [r["paper_id"] for r in all_rows if r["paper_id"] != sr_id]
-
-    _batch_validate_progress = {
-        "running": True, "done": 0, "total": len(paper_ids), "errors": 0
-    }
+    _batch_validate_progress["total"] = len(paper_ids)
 
     llm = OllamaClient(env_path=ENV_PATH)
     results = []
@@ -1297,17 +1287,15 @@ def batch_validate():
             ]
 
             raw = llm.chat(messages, temperature=0.0, model=_chat_model, timeout=120)
-
-            # Parse JSON from response
             try:
-                start = raw.find("{")
-                end = raw.rfind("}") + 1
+                start = raw.find("{"); end = raw.rfind("}") + 1
                 verdict = json.loads(raw[start:end]) if start >= 0 else {"overall": "cannot_verify", "note": raw[:200]}
             except Exception:
                 verdict = {"overall": "cannot_verify", "note": raw[:200]}
 
             results.append({"paper_id": pid, "author": author, "year": year, **verdict})
             _batch_validate_progress["done"] += 1
+            print(f"  ✓ {verdict.get('overall','?')}")
 
         except Exception as e:
             print(f"  ✗ {e}")
@@ -1315,27 +1303,29 @@ def batch_validate():
             _batch_validate_progress["errors"] += 1
             _batch_validate_progress["done"] += 1
 
-        import time as _time
         _time.sleep(3)
 
-    # Aggregate summary
-    counts = {}
+    counts: Dict[str, int] = {}
     for r in results:
         v = r.get("overall", "unknown")
         counts[v] = counts.get(v, 0) + 1
 
-    report = {
-        "total_papers": len(paper_ids),
-        "summary": counts,
-        "results": results,
-    }
-
+    report = {"total_papers": len(paper_ids), "summary": counts, "results": results}
     VALIDATION_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     VALIDATION_REPORT_PATH.write_text(json.dumps(report, indent=2, ensure_ascii=False))
-
     _batch_validate_progress["running"] = False
-    print(f"[BATCH_VALIDATE] Done. Summary: {counts}")
-    return {"status": "ok", **report}
+    print(f"[BATCH_VALIDATE] Done. {counts}")
+
+
+@app.post("/batch_validate")
+def batch_validate():
+    """Start batch validation in background. Returns immediately."""
+    global _batch_validate_progress
+    if _batch_validate_progress["running"]:
+        return {"status": "already_running", **_batch_validate_progress}
+    _batch_validate_progress = {"running": True, "done": 0, "total": 0, "errors": 0}
+    threading.Thread(target=_run_batch_validate, daemon=True).start()
+    return {"status": "started", "message": "Validation running in background."}
 
 
 @app.get("/batch_validate_status")
