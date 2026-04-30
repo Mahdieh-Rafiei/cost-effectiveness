@@ -64,6 +64,30 @@ def extract_all_figure_refs(question: str) -> List[str]:
     return re.findall(r'\bfig(?:ure)?\.?\s*(\d+[a-z]?)\b', question, re.IGNORECASE)
 
 
+def extract_all_table_refs(question: str) -> List[str]:
+    """Extract ALL table numbers from the question."""
+    return re.findall(r'\btable\s*(\d+[a-z]?)\b', question, re.IGNORECASE)
+
+
+def find_table_pages(pdf_path: str, table_num: str) -> List[int]:
+    """Find pages containing a specific table (e.g. '1', '2')."""
+    try:
+        doc = fitz.open(pdf_path)
+        pages = []
+        pattern = re.compile(
+            rf'\btable\s*{re.escape(table_num)}\b',
+            re.IGNORECASE,
+        )
+        for i in range(doc.page_count):
+            text = doc[i].get_text("text")
+            if pattern.search(text):
+                pages.append(i + 1)
+        doc.close()
+        return pages
+    except Exception:
+        return []
+
+
 def is_figure_question(question: str) -> bool:
     keywords = {"figure", "fig", "plot", "chart", "graph", "table", "image",
                 "illustration", "show", "depict", "display"}
@@ -83,14 +107,19 @@ def get_pages_for_question(
     """
     pages: List[int] = []
 
-    # Extract all referenced figure numbers (handles "Fig 4 vs Fig 5" comparisons)
-    fig_nums = extract_all_figure_refs(question)
-    for fig_num in fig_nums:
+    # Find pages for explicitly referenced figures
+    for fig_num in extract_all_figure_refs(question):
         for p in find_figure_pages(pdf_path, fig_num):
             if p not in pages:
                 pages.append(p)
 
-    # Add surrounding page for each figure page (caption often on next page)
+    # Find pages for explicitly referenced tables
+    for tbl_num in extract_all_table_refs(question):
+        for p in find_table_pages(pdf_path, tbl_num):
+            if p not in pages:
+                pages.append(p)
+
+    # Add surrounding page for each located page (caption / continuation)
     extra = []
     for p in pages:
         if p + 1 not in pages:

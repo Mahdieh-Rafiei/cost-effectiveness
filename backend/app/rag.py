@@ -278,7 +278,8 @@ def _build_rag_inputs(
 
         if pdf_path and pdf_path.exists():
             is_review = _is_review_paper(paper_id)
-            max_pages = 10 if is_review else 6
+            has_table = bool(__import__('re').search(r'\btable\b', question, __import__('re').IGNORECASE))
+            max_pages = 12 if (is_review and has_table) else (10 if is_review else 6)
             retrieved_pages = [h["meta"]["page"] for h in all_hits[:10]]
             pages_to_render = get_pages_for_question(
                 str(pdf_path), question, retrieved_pages, max_pages=max_pages
