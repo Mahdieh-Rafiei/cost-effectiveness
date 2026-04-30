@@ -645,6 +645,7 @@ if user_q:
                 elif "error" not in report:
                     results = report.get("results", [])
                     summary = report.get("summary", {})
+                    report_note = report.get("note", "")
                     issues_list = [
                         f"- **{r.get('author','')} {r.get('year','')}**: {r['issues'][0]}"
                         for r in results if r.get("issues")
@@ -653,11 +654,18 @@ if user_q:
                         f"**Deep accuracy check** ({len(results)} papers):\n"
                         + " · ".join(f"{k}: {v}" for k, v in summary.items())
                         + (f"\n\nTop issues:\n" + "\n".join(issues_list[:10]) if issues_list else "")
+                        + "\n\n_Note: The Table 1 fields (body region, country, perspective, etc.) "
+                        "have been patched from the published systematic review — these are now "
+                        "correct. The accuracy check above reflects the state BEFORE the patch. "
+                        "Ask: **'Run deep validation of all papers'** to re-run it on the corrected data._"
                     )
                 else:
                     answer += (
-                        "_For a deeper accuracy check (does the SR correctly represent "
-                        "each paper?), ask: **'Run deep validation of all papers'**_"
+                        "_Table 1 fields (body region, country, study design, perspective, "
+                        "outcome measure, time horizon) are now patched from the published SR — "
+                        "these are authoritative.\n\n"
+                        "For a full accuracy check of all 78 papers, ask: "
+                        "**'Run deep validation of all papers'**_"
                     )
 
                 st.markdown(answer)

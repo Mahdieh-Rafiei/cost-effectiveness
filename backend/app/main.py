@@ -63,10 +63,21 @@ store = VectorStore(persist_dir=str(CHROMA_DIR), env_path=ENV_PATH, collection_n
 
 
 @app.on_event("startup")
-def _auto_start_validation():
-    """Auto-start batch validation in background if no saved report exists."""
+def _on_startup():
+    # 1. Apply Table 1 patch immediately (idempotent SQL UPDATEs)
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from patch_from_table1 import patch as _patch
+        result = _patch(db_path=str(DATA_DIR / "ce_studies.sqlite3"))
+        print(f"[STARTUP] Table 1 patch applied: {result['updated']} papers updated, "
+              f"{result['not_found']} not found")
+    except Exception as e:
+        print(f"[STARTUP] Table 1 patch failed: {e}")
+
+    # 2. Auto-start batch validation in background if no saved report exists
     if not VALIDATION_REPORT_PATH.exists():
-        print("[STARTUP] No validation report found — starting background validation…")
+        print("[STARTUP] No validation report — starting background validation…")
         threading.Thread(target=_run_batch_validate, daemon=True).start()
     else:
         print("[STARTUP] Validation report already exists — ready to answer instantly.")
