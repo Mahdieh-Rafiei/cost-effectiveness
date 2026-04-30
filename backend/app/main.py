@@ -61,6 +61,16 @@ VALIDATION_REPORT_PATH = DATA_DIR / "validation_report.json"
 app = FastAPI(title="Cost-Effectiveness Physiotherapy RAG")
 store = VectorStore(persist_dir=str(CHROMA_DIR), env_path=ENV_PATH, collection_name="papers")
 
+
+@app.on_event("startup")
+def _auto_start_validation():
+    """Auto-start batch validation in background if no saved report exists."""
+    if not VALIDATION_REPORT_PATH.exists():
+        print("[STARTUP] No validation report found — starting background validation…")
+        threading.Thread(target=_run_batch_validate, daemon=True).start()
+    else:
+        print("[STARTUP] Validation report already exists — ready to answer instantly.")
+
 # ── Global model state (changed at runtime via /set_model) ────────────────────
 from dotenv import load_dotenv
 load_dotenv(ENV_PATH)

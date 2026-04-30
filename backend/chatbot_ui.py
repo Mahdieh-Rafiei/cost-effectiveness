@@ -523,6 +523,11 @@ if user_q:
     }
     _is_validate = any(k in q_lower for k in _VALIDATE_KW)
 
+    _is_review_selected = active_paper_id and (
+        "systematic review" in active_paper_id.lower() or
+        "review of trial" in active_paper_id.lower()
+    )
+
     # "Run deep validation" explicitly triggers background LLM validation
     if "run deep validation" in q_lower and _is_review_selected:
         _post("/batch_validate", {})
@@ -535,10 +540,6 @@ if user_q:
             st.markdown(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
         st.stop()
-    _is_review_selected = active_paper_id and (
-        "systematic review" in active_paper_id.lower() or
-        "review of trial" in active_paper_id.lower()
-    )
 
     if mode == "Cross-paper":
         use_compare = True
