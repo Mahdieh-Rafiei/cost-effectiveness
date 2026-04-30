@@ -621,9 +621,8 @@ if user_q:
                 f"**Table 2 — Intervention details ({total} papers, avg: {avg2}%)**\n\n"
                 f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}\n\n---\n\n"
             )
-            st.markdown(stats_md)
 
-            # Stream LLM explanation
+            # Use single placeholder to avoid double-render (stats + streaming explanation)
             stats_text = "\n".join(
                 f"- {k.replace('_', ' ').title()}: {v['pct']}% extracted ({v['extracted']}/{total} papers)"
                 for k, v in t2.items()
@@ -639,17 +638,17 @@ if user_q:
                 f"and (5) which fields are most critical to improve first."
             )
             placeholder = st.empty()
-            placeholder.markdown("_Analysing coverage…_")
+            placeholder.markdown(stats_md + "_Analysing coverage…_")
             explanation = ""
             for meta, chunk in _stream_ask({
                 "question": crafted_q,
                 "top_k": 0,
-                "paper_id": None,   # No vision/RAG — question is self-contained
+                "paper_id": None,
                 "history": [],
             }):
                 explanation += chunk
-                placeholder.markdown(explanation + "◌")
-            placeholder.markdown(explanation)
+                placeholder.markdown(stats_md + explanation + "◌")
+            placeholder.markdown(stats_md + explanation)
             answer = stats_md + explanation
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.stop()
@@ -689,9 +688,7 @@ if user_q:
                         f"_{patched} updated · {unmatched_n} PDFs not matched by author+year_\n\n"
                         f"| Field | Correct | Minor diff | Missing |\n|---|---|---|---|\n{field_rows}\n\n---\n\n"
                     )
-                    st.markdown(stats_md)
-
-                    # Build summary for LLM
+                    # Build LLM prompt from the stats
                     field_summary_text = "\n".join(
                         f"- {k.replace('_',' ').title()}: {v['correct']}/{total_p} correct, "
                         f"{v['incorrect']} differ, {v['missing']} missing"
@@ -718,18 +715,19 @@ if user_q:
                         f"(4) what we can reliably answer about study design, perspective, and outcomes."
                     )
 
+                    # Single placeholder — stats + streaming explanation, no double render
                     placeholder = st.empty()
-                    placeholder.markdown("_Analysing extraction quality…_")
+                    placeholder.markdown(stats_md + "_Analysing extraction quality…_")
                     explanation = ""
                     for meta, chunk in _stream_ask({
                         "question": crafted_q,
                         "top_k": 0,
-                        "paper_id": None,   # No vision/RAG — question is self-contained
+                        "paper_id": None,
                         "history": [],
                     }):
                         explanation += chunk
-                        placeholder.markdown(explanation + "◌")
-                    placeholder.markdown(explanation)
+                        placeholder.markdown(stats_md + explanation + "◌")
+                    placeholder.markdown(stats_md + explanation)
                     answer = stats_md + explanation
 
                 st.session_state.messages.append({"role": "assistant", "content": answer})
