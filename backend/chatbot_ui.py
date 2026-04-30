@@ -549,6 +549,42 @@ if user_q:
         st.session_state.messages.append({"role": "assistant", "content": answer})
         st.stop()
 
+    # Table 2 dose re-extraction
+    _T2_REBUILD_KW = {
+        "improve table 2", "fix table 2", "re-extract table 2", "rebuild table 2",
+        "improve dose", "fix frequency", "fix session", "improve coverage",
+        "targeted re-extraction", "re-extract dose", "improve intervention",
+    }
+    if any(k in q_lower for k in _T2_REBUILD_KW):
+        t2_status = _get("/rebuild_table2_status")
+        if t2_status.get("running"):
+            done = t2_status.get("done", 0)
+            total = t2_status.get("total", 0)
+            upd = t2_status.get("updated", 0)
+            answer = (
+                f"Table 2 re-extraction is already running: **{done}/{total}** papers processed, "
+                f"**{upd}** updated so far. Ask 'What is the Table 2 coverage?' when done."
+            )
+        else:
+            _post("/rebuild_table2", {})
+            answer = (
+                "Table 2 dose re-extraction started for all papers with missing fields.\n\n"
+                "The system will now search each paper specifically for:\n"
+                "- Session frequency (how many times per week)\n"
+                "- Session length (minutes per session)\n"
+                "- Total sessions\n"
+                "- Duration in weeks\n"
+                "- Supervision type\n"
+                "- Intervention and comparator details\n"
+                "- ICER values\n\n"
+                "Takes ~10-15 minutes. Ask **'What is the Table 2 coverage?'** when done "
+                "to see the improved extraction rates."
+            )
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.stop()
+
     # "Fix extractions" / "rebuild" triggers re-extraction of failed papers (uses LLM)
     _REBUILD_KW = {"fix incorrect", "improve extraction"}
     if any(k in q_lower for k in _REBUILD_KW):
@@ -617,9 +653,22 @@ if user_q:
                 f"| {k.replace('_', ' ').title()} | {_bar2(v['pct'])} | {v['extracted']}/{total} |"
                 for k, v in t2.items()
             )
+            # Check if re-extraction is running
+            t2_prog = _get("/rebuild_table2_status")
+            t2_running_note = ""
+            if t2_prog.get("running"):
+                rb_done = t2_prog.get("done", 0)
+                rb_total = t2_prog.get("total", 0)
+                rb_upd = t2_prog.get("updated", 0)
+                t2_running_note = (
+                    f"\n\n_Re-extraction in progress: {rb_done}/{rb_total} papers, "
+                    f"{rb_upd} updated — refresh to see progress_\n\n"
+                )
+
             stats_md = (
                 f"**Table 2 — Intervention details ({total} papers, avg: {avg2}%)**\n\n"
-                f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}\n\n---\n\n"
+                f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}"
+                f"{t2_running_note}\n\n---\n\n"
             )
 
             # Use single placeholder to avoid double-render (stats + streaming explanation)

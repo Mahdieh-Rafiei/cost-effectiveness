@@ -380,3 +380,248 @@ def rebuild_failed_papers(
 
 def get_rebuild_failed_progress() -> Dict[str, Any]:
     return dict(_rebuild_failed_progress)
+
+
+# ── Targeted Table 2 dose re-extraction ──────────────────────────────────────
+
+# Queries specifically targeting intervention dose fields
+_DOSE_QUERIES = [
+    "sessions per week frequency visits appointments treatment schedule intensity",
+    "session duration minutes length time per visit appointment",
+    "total number of sessions visits encounters treatment programme",
+    "weeks months duration intervention period treatment length programme",
+    "supervised home-based group individual physiotherapy delivery setting",
+    "exercise programme content manual therapy education intervention description",
+    "comparator control usual care surgery injection medical treatment",
+    "ICER incremental cost effectiveness ratio cost per QALY net monetary benefit",
+]
+
+_DOSE_PROMPT = """Paper ID: {paper_id}
+
+Extract ONLY the following intervention delivery details from the evidence.
+Look carefully in methods sections for specific numbers and frequencies.
+
+Return ONLY valid JSON — no markdown, no explanation:
+{{
+  "frequency": "<sessions per week e.g. 2x/week, 3 times/week — or unknown>",
+  "total_sessions": "<total number e.g. 12, 18 — or unknown>",
+  "session_length": "<minutes e.g. 60 min, 30-45 min — or unknown>",
+  "duration_weeks": "<weeks e.g. 8, 12 — or unknown>",
+  "supervision": "<supervised|home-based|group|mixed|unknown>",
+  "intervention_type": "<exercise|manual_therapy|education|exercise+manual_therapy|exercise+education|mixed_physiotherapy|other|unknown>",
+  "comparator_type": "<usual_care|medical_care|surgery|injection|wait_list|other_physiotherapy|education|other|unknown>",
+  "icer": "<ICER value e.g. £23456/QALY, EUR 4984/QALY — or unknown>"
+}}
+
+Evidence:
+{context}
+"""
+
+_rebuild_table2_progress: Dict[str, Any] = {
+    "running": False, "done": 0, "total": 0, "updated": 0, "errors": 0
+}
+
+
+def _gather_dose_context(store: VectorStore, paper_id: str) -> str:
+    """
+    Gather context specifically targeting intervention dose fields.
+    Uses 8 dose-focused queries against the paper + SR chunks about this paper.
+    """
+    from .ollama_client import OllamaClient as _OC  # avoid circular at module level
+
+    seen_keys: set = set()
+    hits_all: List[Dict[str, Any]] = []
+
+    for query in _DOSE_QUERIES:
+        try:
+            hits = store.query(query, k=5, where={"paper_id": paper_id})
+        except Exception:
+            hits = []
+        for h in hits:
+            key = h["text"][:120]
+            if key not in seen_keys:
+                seen_keys.add(key)
+                hits_all.append(h)
+
+    # Build paper context
+    parts: List[str] = []
+    used = 0
+    for h in hits_all:
+        block = f"[p.{h['meta'].get('page','?')}] {h['text']}"
+        if used + len(block) > 10000:
+            break
+        parts.append(block)
+        used += len(block)
+    paper_context = "\n\n".join(parts)
+
+    # Add SR context for this paper
+    pid_parts = paper_id.split("-", 2)
+    author = pid_parts[0].strip() if pid_parts else ""
+    year_m = re.search(r'\b(19|20)\d{2}\b', paper_id)
+    year = year_m.group(0) if year_m else ""
+
+    if author and year:
+        sr_rows = query_sql(
+            "SELECT DISTINCT paper_id FROM ce_comparisons "
+            "WHERE lower(paper_id) LIKE '%systematic review%' "
+            "   OR lower(paper_id) LIKE '%review of trial%'", ()
+        )
+        if sr_rows:
+            sr_id = sr_rows[0]["paper_id"]
+            try:
+                sr_hits = store.query(
+                    f"{author} {year} intervention sessions frequency duration supervised",
+                    k=5, where={"paper_id": sr_id},
+                )
+                if sr_hits:
+                    sr_text = "\n\n".join(
+                        f"[SR p.{h['meta']['page']}] {h['text']}" for h in sr_hits
+                    )
+                    return (
+                        f"=== SYSTEMATIC REVIEW summary for this paper ===\n"
+                        f"{sr_text}\n\n"
+                        f"=== PAPER TEXT ===\n{paper_context}"
+                    )
+            except Exception:
+                pass
+
+    return paper_context
+
+
+def rebuild_table2_dose(store: VectorStore, env_path: str) -> Dict[str, Any]:
+    """
+    Targeted re-extraction of Table 2 dose fields:
+    frequency, total_sessions, session_length, duration_weeks,
+    supervision, intervention_type, comparator_type, icer.
+
+    Only updates fields that are currently 'unknown' — never overwrites
+    existing extracted values.
+    """
+    global _rebuild_table2_progress
+    import json as _json
+
+    from .ollama_client import OllamaClient
+
+    TARGET_FIELDS = [
+        "frequency", "total_sessions", "session_length", "duration_weeks",
+        "supervision", "intervention_type", "comparator_type", "icer",
+    ]
+    UNKNOWN_VALS = {"unknown", "unclear", "", "none", "n/a"}
+
+    # Find papers missing at least one dose field
+    rows = query_sql("""
+        SELECT DISTINCT paper_id FROM ce_comparisons
+        WHERE (frequency   IN ('unknown','unclear','') OR frequency   IS NULL)
+           OR (total_sessions IN ('unknown','unclear','') OR total_sessions IS NULL)
+           OR (session_length  IN ('unknown','unclear','') OR session_length IS NULL)
+           OR (duration_weeks  IN ('unknown','unclear','') OR duration_weeks IS NULL)
+    """, ())
+
+    paper_ids = [
+        r["paper_id"] for r in rows
+        if "systematic review" not in r["paper_id"].lower()
+        and "review of trial" not in r["paper_id"].lower()
+    ]
+
+    _rebuild_table2_progress = {
+        "running": True, "done": 0, "total": len(paper_ids),
+        "updated": 0, "errors": 0,
+    }
+
+    llm = OllamaClient(env_path=env_path)
+    updated = 0
+    errors_count = 0
+
+    for paper_id in paper_ids:
+        print(f"[REBUILD_T2] {paper_id}")
+        try:
+            context = _gather_dose_context(store, paper_id)
+            if not context.strip():
+                print("  ⚠ No context")
+                errors_count += 1
+                _rebuild_table2_progress["errors"] += 1
+                _rebuild_table2_progress["done"] += 1
+                continue
+
+            messages = [
+                {"role": "system", "content":
+                    "You are a health economics expert extracting intervention details. "
+                    "Return ONLY valid JSON, no markdown, no explanation."},
+                {"role": "user", "content":
+                    _DOSE_PROMPT.format(paper_id=paper_id, context=context)},
+            ]
+            raw = llm.chat(messages, temperature=0.0, think=False, timeout=90)
+
+            try:
+                start = raw.find("{"); end = raw.rfind("}") + 1
+                extracted = _json.loads(raw[start:end]) if start >= 0 else {}
+            except Exception:
+                extracted = {}
+
+            if not extracted:
+                print("  ⚠ No JSON extracted")
+                errors_count += 1
+                _rebuild_table2_progress["errors"] += 1
+                _rebuild_table2_progress["done"] += 1
+                continue
+
+            # Get current DB values
+            current_rows = query_sql(
+                "SELECT * FROM ce_comparisons WHERE paper_id = ?", (paper_id,)
+            )
+            if not current_rows:
+                _rebuild_table2_progress["done"] += 1
+                continue
+
+            # Build updates: only overwrite currently-unknown fields
+            updates: Dict[str, str] = {}
+            for field in TARGET_FIELDS:
+                new_val = str(extracted.get(field, "")).strip()
+                if not new_val or new_val.lower() in UNKNOWN_VALS:
+                    continue
+                # Apply to ALL comparison rows for this paper
+                # (check each row individually)
+                updates[field] = new_val
+
+            if updates:
+                conn = get_conn()
+                for crow in current_rows:
+                    row_updates = {
+                        f: v for f, v in updates.items()
+                        if str(crow.get(f, "")).lower().strip() in UNKNOWN_VALS
+                    }
+                    if row_updates:
+                        set_clauses = ", ".join(f"{k} = ?" for k in row_updates)
+                        conn.execute(
+                            f"UPDATE ce_comparisons SET {set_clauses} "
+                            f"WHERE comparison_id = ?",
+                            list(row_updates.values()) + [crow["comparison_id"]],
+                        )
+                conn.commit()
+                conn.close()
+                print(f"  ✓ {list(updates.keys())}")
+                updated += 1
+            else:
+                print("  ⚠ No new values found")
+
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"  ✗ ERROR: {e}")
+            errors_count += 1
+            _rebuild_table2_progress["errors"] += 1
+
+        _rebuild_table2_progress["done"] += 1
+        _rebuild_table2_progress["updated"] = updated
+
+    _rebuild_table2_progress["running"] = False
+    return {
+        "status": "ok",
+        "total_processed": len(paper_ids),
+        "updated": updated,
+        "errors": errors_count,
+    }
+
+
+def get_rebuild_table2_progress() -> Dict[str, Any]:
+    return dict(_rebuild_table2_progress)

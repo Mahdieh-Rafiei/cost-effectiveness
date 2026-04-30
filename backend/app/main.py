@@ -45,7 +45,9 @@ from .pdf_extract import extract_pdf_pages
 from .chunking import make_chunks
 from .vectorstore import VectorStore
 from .rag import answer_question, answer_question_stream
-from .ce_build import build_ce_table, rebuild_unclear_papers, rebuild_failed_papers, get_rebuild_failed_progress
+from .ce_build import (build_ce_table, rebuild_unclear_papers,
+                       rebuild_failed_papers, get_rebuild_failed_progress,
+                       rebuild_table2_dose, get_rebuild_table2_progress)
 from .table1_corrections import CORRECTIONS as TABLE1_CORRECTIONS, CHECK_FIELDS, UNKNOWN_VALS
 from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
@@ -436,6 +438,32 @@ def rebuild_failed():
 def rebuild_failed_status():
     """Check re-extraction progress."""
     return get_rebuild_failed_progress()
+
+
+@app.post("/rebuild_table2")
+def rebuild_table2_endpoint():
+    """
+    Targeted re-extraction of Table 2 dose fields for papers with unknown values.
+    Runs in background. Queries frequency, session length, total sessions,
+    duration, supervision, intervention type, comparator, ICER.
+    Only overwrites 'unknown' fields — never clobbers existing data.
+    """
+    progress = get_rebuild_table2_progress()
+    if progress.get("running"):
+        return {"status": "already_running", **progress}
+    threading.Thread(
+        target=rebuild_table2_dose,
+        kwargs={"store": store, "env_path": ENV_PATH},
+        daemon=True,
+    ).start()
+    return {"status": "started",
+            "message": "Table 2 dose re-extraction running in background (~10-15 min)."}
+
+
+@app.get("/rebuild_table2_status")
+def rebuild_table2_status():
+    """Check Table 2 re-extraction progress."""
+    return get_rebuild_table2_progress()
 
 
 @app.get("/paper_info")
