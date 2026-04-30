@@ -596,7 +596,7 @@ if user_q:
 
         answer = ""
 
-        # ── Table 2 coverage question ────────────────────────────────────────
+        # ── Table 2 coverage: get stats, then let LLM explain ───────────────
         _TABLE2_KW = {"table 2 coverage", "table2 coverage", "coverage of table 2",
                       "table 2 extraction", "what is the table 2", "show table 2 coverage",
                       "intervention coverage", "frequency coverage", "sessions coverage",
@@ -609,94 +609,130 @@ if user_q:
             total = qv.get("total_papers", 0)
             avg2 = qv.get("table2_avg_coverage_pct", 0)
 
+            # Show stats table
             def _bar2(pct):
                 filled = round(pct / 10)
                 return "█" * filled + "░" * (10 - filled) + f" {pct}%"
-
             t2_rows = "\n".join(
                 f"| {k.replace('_', ' ').title()} | {_bar2(v['pct'])} | {v['extracted']}/{total} |"
                 for k, v in t2.items()
             )
-            answer = (
-                f"**Table 2 — Intervention details coverage across {total} papers** (avg: {avg2}%)\n\n"
-                f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}\n\n"
-                f"_Table 2 fields (frequency, sessions, duration, supervision, ICER) come from LLM extraction "
-                f"of individual PDFs — they are harder to automate than Table 1. "
-                f"Fields below 30% need a targeted re-extraction pass._"
+            stats_md = (
+                f"**Table 2 — Intervention details ({total} papers, avg: {avg2}%)**\n\n"
+                f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}\n\n---\n\n"
             )
-            st.markdown(answer)
+            st.markdown(stats_md)
+
+            # Stream LLM explanation
+            stats_text = "\n".join(
+                f"- {k.replace('_', ' ').title()}: {v['pct']}% extracted ({v['extracted']}/{total} papers)"
+                for k, v in t2.items()
+            )
+            crafted_q = (
+                f"We have a database of {total} physiotherapy cost-effectiveness papers. "
+                f"Table 2 captures intervention details. Here is the current extraction coverage:\n\n"
+                f"{stats_text}\n\n"
+                f"Please explain: (1) what each field represents clinically, "
+                f"(2) why fields like frequency (12%) and session length (8%) have such low coverage, "
+                f"(3) which research questions we can reliably answer with this data, "
+                f"(4) which questions we cannot answer due to missing data, "
+                f"and (5) which fields are most critical to improve first."
+            )
+            placeholder = st.empty()
+            placeholder.markdown("_Analysing coverage…_")
+            explanation = ""
+            for meta, chunk in _stream_ask({
+                "question": crafted_q,
+                "top_k": 8,
+                "paper_id": active_paper_id,
+                "history": [],
+            }):
+                explanation += chunk
+                placeholder.markdown(explanation + "◌")
+            placeholder.markdown(explanation)
+            answer = stats_md + explanation
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.stop()
 
         if _is_validate and active_paper_id and not use_compare:
             if _is_review_selected:
-                # Direct comparison of DB values vs Table 1 ground truth
-                with st.spinner("Checking each paper against Table 1…"):
+                # Get Table 1 comparison data
+                with st.spinner("Checking each paper against published Table 1…"):
                     vt1 = _get("/validate_table1")
 
                 if "error" in vt1:
                     answer = f"⚠️ {vt1['error']}"
                     st.markdown(answer)
                 else:
-                    total = vt1.get("total_papers_checked", 0)
-                    pct = vt1.get("overall_correct_pct", 0)
+                    total_p = vt1.get("total_papers_checked", 0)
                     patched = vt1.get("patches_applied", 0)
-                    unmatched = vt1.get("unmatched_count", 0)
+                    unmatched_n = vt1.get("unmatched_count", 0)
                     fs = vt1.get("field_summary", {})
                     paper_results = vt1.get("paper_results", [])
 
-                    def _bar(n, total_papers):
-                        p = round(n / max(total_papers, 1) * 100)
+                    def _bar(n, tp):
+                        p = round(n / max(tp, 1) * 100)
                         filled = round(p / 10)
-                        return "█" * filled + "░" * (10 - filled) + f" {p}% ({n}/{total_papers})"
+                        return "█" * filled + "░" * (10 - filled) + f" {p}% ({n}/{tp})"
 
                     field_rows = "\n".join(
                         f"| {k.replace('_',' ').title()} "
-                        f"| {_bar(v['correct'], total)} "
+                        f"| {_bar(v['correct'], total_p)} "
                         f"| {v['incorrect']} differ "
                         f"| {v['missing']} missing |"
                         for k, v in fs.items()
                     )
-
-                    # Papers with values that differ from Table 1 after patch
                     differ_papers = [p for p in paper_results if p["counts"]["incorrect"] > 0]
-                    missing_papers = [
-                        p for p in paper_results
-                        if p["counts"]["incorrect"] == 0 and p["counts"]["missing"] > 0
-                    ]
 
-                    differ_lines = []
-                    for p in differ_papers[:12]:
-                        pid = p["paper_id"].split("-")[0]
-                        diffs = [
-                            f"{f}: `{d['db']}` vs Table 1: `{d['correct']}`"
-                            for f, d in p["fields"].items() if d["status"] == "incorrect"
-                        ]
-                        differ_lines.append(f"- **{pid}**: {'; '.join(diffs)}")
-
-                    answer = (
-                        f"**Table 1 extraction — {total} papers checked and patched from published SR**\n\n"
-                        f"_{patched} papers updated · {unmatched} PDFs not matched by name_\n\n"
-                        f"| Field | Correct | Minor diff | Missing |\n|---|---|---|---|\n{field_rows}\n\n"
+                    stats_md = (
+                        f"**Table 1 — {total_p} papers checked and patched from published SR**\n"
+                        f"_{patched} updated · {unmatched_n} PDFs not matched by author+year_\n\n"
+                        f"| Field | Correct | Minor diff | Missing |\n|---|---|---|---|\n{field_rows}\n\n---\n\n"
                     )
-                    if differ_lines:
-                        answer += (
-                            f"**{len(differ_papers)} papers have minor formatting differences** "
-                            f"(e.g. 'USA' vs 'US', '1 year' vs '12 months') — the data is correct but "
-                            f"wording differs from Table 1:\n" + "\n".join(differ_lines) + "\n\n"
+                    st.markdown(stats_md)
+
+                    # Build summary for LLM
+                    field_summary_text = "\n".join(
+                        f"- {k.replace('_',' ').title()}: {v['correct']}/{total_p} correct, "
+                        f"{v['incorrect']} differ, {v['missing']} missing"
+                        for k, v in fs.items()
+                    )
+                    differ_text = ""
+                    if differ_papers:
+                        differ_text = "\n".join(
+                            f"- {p['paper_id'].split('-')[0]}: " +
+                            "; ".join(f"{f}='{d['db']}' (should be '{d['correct']}')"
+                                      for f, d in p["fields"].items() if d["status"] == "incorrect")
+                            for p in differ_papers[:8]
                         )
-                    if missing_papers:
-                        answer += (
-                            f"**{len(missing_papers)} matched papers still have some empty fields** "
-                            f"— these are Table 2 fields (intervention dose, ICER) not covered by Table 1.\n\n"
-                        )
-                    answer += (
-                        f"_Table 1 fields are now authoritative. "
-                        f"For Table 2 (intervention frequency, sessions, ICER), "
-                        f"ask: 'What is the Table 2 coverage?'_"
+
+                    crafted_q = (
+                        f"We checked {total_p} physiotherapy cost-effectiveness papers "
+                        f"against the published systematic review Table 1. Results:\n\n"
+                        f"{field_summary_text}\n\n"
+                        + (f"Papers with minor formatting differences:\n{differ_text}\n\n" if differ_text else "")
+                        + f"{unmatched_n} PDFs could not be matched (no PDF available for those papers).\n\n"
+                        f"Please explain: (1) how accurate our Table 1 extraction is overall, "
+                        f"(2) what the minor differences mean (e.g. 'USA' vs 'US'), "
+                        f"(3) whether these differences affect research conclusions, "
+                        f"(4) what we can reliably answer about study design, perspective, and outcomes."
                     )
 
-                st.markdown(answer)
+                    placeholder = st.empty()
+                    placeholder.markdown("_Analysing extraction quality…_")
+                    explanation = ""
+                    for meta, chunk in _stream_ask({
+                        "question": crafted_q,
+                        "top_k": 8,
+                        "paper_id": active_paper_id,
+                        "history": [],
+                    }):
+                        explanation += chunk
+                        placeholder.markdown(explanation + "◌")
+                    placeholder.markdown(explanation)
+                    answer = stats_md + explanation
+
+                st.session_state.messages.append({"role": "assistant", "content": answer})
 
             else:
                 # Individual paper — validate vs systematic review
@@ -704,6 +740,7 @@ if user_q:
                     val = _get(f"/validate_vs_review/{active_paper_id}")
                     answer = val.get("validation", val.get("error", "Could not validate."))
                 st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
 
         elif mode == "Compare papers":
             if not active_paper_id or not st.session_state.paper_b:
