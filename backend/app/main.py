@@ -306,10 +306,9 @@ def validate_table1():
     from the published systematic review. Returns exact correct/incorrect/missing
     status per paper per field — no LLM, no caching, always fresh.
     """
-    conn = get_conn()
-    all_pids = [r[0] for r in conn.execute(
-        "SELECT DISTINCT paper_id FROM ce_comparisons"
-    ).fetchall()]
+    # query_sql sets row_factory and returns list of dicts — safe field-name access
+    all_rows_distinct = query_sql("SELECT DISTINCT paper_id FROM ce_comparisons", ())
+    all_pids = [r["paper_id"] for r in all_rows_distinct]
 
     paper_results = []
     applied: set = set()
@@ -330,15 +329,16 @@ def validate_table1():
         pid = matches[0]
         applied.add(pid)
 
-        row = conn.execute(
+        rows = query_sql(
             "SELECT * FROM ce_comparisons WHERE paper_id = ? LIMIT 1", (pid,)
-        ).fetchone()
-        if not row:
+        )
+        if not rows:
             continue
+        row = rows[0]  # dict with field-name keys
 
         field_results = {}
         for field in CHECK_FIELDS:
-            db_val = str(row[field] or "").strip()
+            db_val = str(row.get(field) or "").strip()
             correct_val = str(corr.get(field, "")).strip()
             db_lower = db_val.lower()
             if db_lower in UNKNOWN_VALS or db_val == "":
@@ -360,8 +360,6 @@ def validate_table1():
             "fields": field_results,
             "counts": counts,
         })
-
-    conn.close()
 
     total = len(paper_results)
     field_summary = {}
