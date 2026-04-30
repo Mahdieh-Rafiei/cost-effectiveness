@@ -1112,6 +1112,100 @@ def validate_extraction(paper_id: str):
     }
 
 
+# ── Validate individual paper against systematic review ───────────────────────
+
+@app.get("/validate_vs_review/{paper_id}")
+def validate_vs_review(paper_id: str):
+    """
+    Cross-validate: compare what the systematic review says about this paper
+    against what the original paper actually reports and what the DB extracted.
+    """
+    import re as _re
+
+    # Extract author + year from paper_id (format: "Author-YEAR-Title")
+    parts = paper_id.split("-", 2)
+    author = parts[0].strip() if parts else ""
+    year_m = _re.search(r'\b(19|20)\d{2}\b', paper_id)
+    year = year_m.group(0) if year_m else ""
+
+    if not author or not year:
+        return {"error": f"Cannot extract author/year from paper_id: {paper_id}"}
+
+    # Find the systematic review paper ID
+    sr_rows = query_sql(
+        "SELECT DISTINCT paper_id FROM ce_comparisons "
+        "WHERE lower(paper_id) LIKE '%systematic review%' "
+        "   OR lower(paper_id) LIKE '%review of trial%'", ()
+    )
+    if not sr_rows:
+        return {"error": "Systematic review paper not found in database."}
+    sr_id = sr_rows[0]["paper_id"]
+
+    # Retrieve systematic review chunks mentioning this author + year
+    sr_hits = store.query(
+        f"{author} {year} cost-effectiveness ICER intervention comparator",
+        k=10, where={"paper_id": sr_id},
+    )
+    sr_context = "\n".join(
+        f"[SR p.{h['meta']['page']}] {h['text']}" for h in sr_hits
+    )
+
+    # Retrieve original paper chunks
+    paper_hits = store.query(
+        "cost-effectiveness ICER intervention comparator study design sample size",
+        k=10, where={"paper_id": paper_id},
+    )
+    paper_context = "\n".join(
+        f"[p.{h['meta']['page']}] {h['text']}" for h in paper_hits
+    )
+
+    if not paper_context.strip():
+        return {"error": f"No text found for paper: {paper_id}. Is it ingested?"}
+
+    # DB extraction for this paper
+    db_rows = query_sql("SELECT * FROM ce_comparisons WHERE paper_id = ?", (paper_id,))
+    db_summary = {}
+    if db_rows:
+        r = db_rows[0]
+        db_summary = {k: r.get(k) for k in [
+            "body_region", "condition", "intervention_type", "comparator_type",
+            "icer", "quadrant", "ce_conclusion", "time_horizon", "perspective",
+            "outcome_measure", "frequency", "total_sessions", "duration_weeks",
+        ]}
+
+    llm = OllamaClient(env_path=ENV_PATH)
+    messages = [
+        {"role": "system", "content": (
+            "You are validating a systematic review's accuracy for one specific study. "
+            "You have three sources:\n"
+            "1. What the systematic review (SR) says about this paper\n"
+            "2. What the original paper actually reports\n"
+            "3. What was automatically extracted into our database\n\n"
+            "For each key field, state: CORRECT / INCORRECT / CANNOT VERIFY.\n"
+            "Fields to check: body region, intervention, comparator, ICER, quadrant, "
+            "time horizon, perspective, sample size, outcome measure.\n"
+            "Quote the source when flagging an error. Be concise."
+        )},
+        {"role": "user", "content": (
+            f"Paper: {paper_id}\n\n"
+            f"=== SYSTEMATIC REVIEW text about {author} ({year}) ===\n{sr_context}\n\n"
+            f"=== ORIGINAL PAPER text ===\n{paper_context}\n\n"
+            f"=== DATABASE extraction ===\n{json.dumps(db_summary, indent=2)}\n\n"
+            "Does the systematic review accurately represent this paper? "
+            "Does the database extraction match both? Report field by field."
+        )},
+    ]
+
+    verdict = _llm_narrative(messages, temperature=0.0)
+    return {
+        "paper_id":   paper_id,
+        "author":     author,
+        "year":       year,
+        "sr_paper":   sr_id,
+        "validation": verdict,
+    }
+
+
 # ── 2. Review Fig 5 placements ────────────────────────────────────────────────
 
 class ReviewFig5Request(BaseModel):

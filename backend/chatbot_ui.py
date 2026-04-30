@@ -371,6 +371,19 @@ with st.sidebar:
             for sq in suggestions[:4]:
                 st.markdown(f'<div class="example-q">💬 {sq}</div>', unsafe_allow_html=True)
 
+            # ── Validate vs systematic review ─────────────────────────────────
+            st.markdown("---")
+            if st.button("🔍 Validate vs. systematic review",
+                         use_container_width=True,
+                         help="Check if the systematic review correctly represents this paper"):
+                with st.spinner("Cross-checking with systematic review…"):
+                    val = _get(f"/validate_vs_review/{pid}")
+                if "error" in val:
+                    st.error(val["error"])
+                else:
+                    st.markdown("**Validation result:**")
+                    st.markdown(val.get("validation", "No result."))
+
     st.markdown("---")
 
     # ── Export chat ───────────────────────────────────────────────────────────
