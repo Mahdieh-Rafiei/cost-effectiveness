@@ -528,9 +528,29 @@ if user_q:
         "review of trial" in active_paper_id.lower()
     )
 
-    # "Fix extractions" / "rebuild" triggers re-extraction of failed papers
-    _REBUILD_KW = {"fix extraction", "fix the extraction", "rebuild extraction",
-                   "re-extract", "reextract", "fix incorrect", "improve extraction"}
+    # "Fix extractions" / "patch" triggers Table 1 patch (instant, no LLM)
+    _PATCH_KW = {"patch table", "fix table 1", "apply table 1", "import table 1",
+                 "fix body region", "fix country", "fix extraction",
+                 "fix the extraction", "rebuild extraction", "re-extract",
+                 "reextract", "fix incorrect", "improve extraction"}
+    if any(k in q_lower for k in _PATCH_KW):
+        with st.spinner("Patching database from Table 1…"):
+            result = _post("/patch_table1", {})
+        n = result.get("updated", "?")
+        not_found = result.get("not_found", 0)
+        answer = (
+            f"Done — patched **{n} papers** with authoritative Table 1 data "
+            f"(body region, country, study design, perspective, outcome measure, time horizon). "
+            f"{not_found} papers could not be matched by author+year."
+            f"\n\nAsk 'Is the content of Tables 1 and 2 correctly extracted?' to see the new coverage."
+        )
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.stop()
+
+    # "Fix extractions" / "rebuild" triggers re-extraction of failed papers (uses LLM)
+    _REBUILD_KW = {"fix incorrect", "improve extraction"}
     if any(k in q_lower for k in _REBUILD_KW):
         _post("/rebuild_failed", {})
         answer = (

@@ -232,6 +232,21 @@ def rebuild_unclear():
     return rebuild_unclear_papers(store=store, env_path=ENV_PATH)
 
 
+@app.post("/patch_table1")
+def patch_table1():
+    """
+    Directly import Table 1 data from the published systematic review into
+    the database. Fixes body_region, country, study_design, perspective,
+    outcome_measure, outcome_type, time_horizon for all 78 papers.
+    Much more reliable than LLM extraction for these fields.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from patch_from_table1 import patch as _patch
+    result = _patch(db_path=str(DATA_DIR / "ce_studies.sqlite3"))
+    return {"status": "ok", **result}
+
+
 @app.post("/rebuild_failed")
 def rebuild_failed():
     """
