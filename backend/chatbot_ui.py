@@ -643,8 +643,8 @@ if user_q:
             explanation = ""
             for meta, chunk in _stream_ask({
                 "question": crafted_q,
-                "top_k": 8,
-                "paper_id": active_paper_id,
+                "top_k": 0,
+                "paper_id": None,   # No vision/RAG — question is self-contained
                 "history": [],
             }):
                 explanation += chunk
@@ -723,8 +723,8 @@ if user_q:
                     explanation = ""
                     for meta, chunk in _stream_ask({
                         "question": crafted_q,
-                        "top_k": 8,
-                        "paper_id": active_paper_id,
+                        "top_k": 0,
+                        "paper_id": None,   # No vision/RAG — question is self-contained
                         "history": [],
                     }):
                         explanation += chunk
