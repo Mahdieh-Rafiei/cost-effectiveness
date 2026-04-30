@@ -518,9 +518,23 @@ if user_q:
         "correctly extracted", "is correct", "are these correct",
         "is it correct", "correctly represented", "validate",
         "agree with the", "do you agree", "is the content",
-        "correctly placed", "extraction correct",
+        "correctly placed", "extraction correct", "run deep validation",
+        "coverage", "how well extracted", "extraction quality",
     }
     _is_validate = any(k in q_lower for k in _VALIDATE_KW)
+
+    # "Run deep validation" explicitly triggers background LLM validation
+    if "run deep validation" in q_lower and _is_review_selected:
+        _post("/batch_validate", {})
+        answer = (
+            "Deep validation started — checking all 78 papers against the systematic review. "
+            "Takes ~15 minutes. Ask 'Is the content of Tables 1 and 2 correctly extracted?' "
+            "when done to see the accuracy results."
+        )
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.stop()
     _is_review_selected = active_paper_id and (
         "systematic review" in active_paper_id.lower() or
         "review of trial" in active_paper_id.lower()
@@ -547,55 +561,62 @@ if user_q:
 
         if _is_validate and active_paper_id and not use_compare:
             if _is_review_selected:
-                # User is asking if the SR's tables correctly represent the 78 papers
+                # Instant database coverage check
+                qv = _get("/quick_validate")
+                t1 = qv.get("table1_fields", {})
+                t2 = qv.get("table2_fields", {})
+                total = qv.get("total_papers", 0)
+                avg1 = qv.get("table1_avg_coverage_pct", 0)
+                avg2 = qv.get("table2_avg_coverage_pct", 0)
+
+                def _bar(pct):
+                    filled = round(pct / 10)
+                    return "█" * filled + "░" * (10 - filled) + f" {pct}%"
+
+                t1_rows = "\n".join(
+                    f"| {k.replace('_',' ').title()} | {_bar(v['pct'])} | {v['extracted']}/{total} |"
+                    for k, v in t1.items()
+                )
+                t2_rows = "\n".join(
+                    f"| {k.replace('_',' ').title()} | {_bar(v['pct'])} | {v['extracted']}/{total} |"
+                    for k, v in t2.items()
+                )
+
+                answer = (
+                    f"**Extraction coverage across {total} individual papers:**\n\n"
+                    f"**Table 1 — Study characteristics** (avg: {avg1}%)\n"
+                    f"| Field | Coverage | Extracted |\n|---|---|---|\n{t1_rows}\n\n"
+                    f"**Table 2 — Intervention details** (avg: {avg2}%)\n"
+                    f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}\n\n"
+                )
+
+                # Add LLM validation status
                 status = _get("/batch_validate_status")
                 report = _get("/batch_validate_report")
 
                 if status.get("running"):
                     done = status.get("done", 0)
-                    total = status.get("total", 0)
-                    answer = (
-                        f"I'm currently cross-validating all {total} papers against "
-                        f"the systematic review ({done}/{total} done). "
-                        f"Please ask me again in a few minutes."
-                    )
-                    st.markdown(answer)
-
+                    tot = status.get("total", 0)
+                    answer += f"_Deep accuracy check running: {done}/{tot} papers validated…_"
                 elif "error" not in report:
-                    # Report exists — summarise it with the LLM
-                    with st.spinner("Summarising validation report…"):
-                        results = report.get("results", [])
-                        summary = report.get("summary", {})
-                        issues_list = []
-                        for r in results:
-                            for issue in r.get("issues", []):
-                                if issue:
-                                    issues_list.append(
-                                        f"- **{r.get('author','')} {r.get('year','')}**: {issue}"
-                                    )
-                        issues_text = "\n".join(issues_list[:20])
-                        answer = (
-                            f"**Cross-validation of {len(results)} papers against the systematic review:**\n\n"
-                            f"| Verdict | Count |\n|---|---|\n"
-                            + "\n".join(
-                                f"| {k.replace('_',' ').title()} | {v} |"
-                                for k, v in sorted(summary.items(), key=lambda x: -x[1])
-                            )
-                            + (f"\n\n**Main discrepancies found ({min(20,len(issues_list))} shown):**\n{issues_text}" if issues_list else "\n\nNo specific discrepancies recorded.")
-                        )
-                    st.markdown(answer)
-
-                else:
-                    # No report yet — trigger it and explain
-                    _post("/batch_validate", {})
-                    answer = (
-                        "I've started a full cross-validation of all 78 papers against "
-                        "the systematic review. This checks whether Tables 1 and 2 correctly "
-                        "represent each individual study.\n\n"
-                        "This takes about **15 minutes**. Ask me the same question again "
-                        "when it's done and I'll give you the full results."
+                    results = report.get("results", [])
+                    summary = report.get("summary", {})
+                    issues_list = [
+                        f"- **{r.get('author','')} {r.get('year','')}**: {r['issues'][0]}"
+                        for r in results if r.get("issues")
+                    ]
+                    answer += (
+                        f"**Deep accuracy check** ({len(results)} papers):\n"
+                        + " · ".join(f"{k}: {v}" for k, v in summary.items())
+                        + (f"\n\nTop issues:\n" + "\n".join(issues_list[:10]) if issues_list else "")
                     )
-                    st.markdown(answer)
+                else:
+                    answer += (
+                        "_For a deeper accuracy check (does the SR correctly represent "
+                        "each paper?), ask: **'Run deep validation of all papers'**_"
+                    )
+
+                st.markdown(answer)
 
             else:
                 # Individual paper — validate vs systematic review

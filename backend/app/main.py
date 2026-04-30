@@ -1342,6 +1342,62 @@ def batch_validate_report():
     return json.loads(VALIDATION_REPORT_PATH.read_text())
 
 
+@app.get("/quick_validate")
+def quick_validate():
+    """
+    Instant database coverage check — no LLM needed.
+    Shows what % of Table 1 and Table 2 fields are populated for each paper.
+    """
+    rows = query_sql("SELECT * FROM ce_comparisons", ())
+    if not rows:
+        return {"error": "No data found. Run /build_ce_table first."}
+
+    # Exclude systematic review itself
+    papers = [r for r in rows if not (
+        "systematic review" in r.get("paper_id","").lower() or
+        "review of trial" in r.get("paper_id","").lower()
+    )]
+    total = len(papers)
+
+    def pct(field, exclude=("unknown", "unclear", "", None)):
+        n = sum(1 for r in papers if r.get(field) not in exclude)
+        return {"extracted": n, "missing": total - n, "pct": round(n / total * 100)}
+
+    table1 = {
+        "body_region":    pct("body_region"),
+        "country":        pct("country"),
+        "study_design":   pct("study_design"),
+        "sample_size":    pct("sample_size"),
+        "time_horizon":   pct("time_horizon"),
+        "perspective":    pct("perspective"),
+        "outcome_type":   pct("outcome_type"),
+        "outcome_measure": pct("outcome_measure"),
+    }
+    table2 = {
+        "intervention_type":   pct("intervention_type"),
+        "frequency":           pct("frequency"),
+        "total_sessions":      pct("total_sessions"),
+        "session_length":      pct("session_length"),
+        "duration_weeks":      pct("duration_weeks"),
+        "supervision":         pct("supervision"),
+        "comparator_type":     pct("comparator_type"),
+        "icer":                pct("icer"),
+        "quadrant":            pct("quadrant", exclude=("unclear", "", None)),
+        "ce_conclusion":       pct("ce_conclusion", exclude=("inconclusive", "", None)),
+    }
+
+    avg_t1 = round(sum(v["pct"] for v in table1.values()) / len(table1))
+    avg_t2 = round(sum(v["pct"] for v in table2.values()) / len(table2))
+
+    return {
+        "total_papers": total,
+        "table1_avg_coverage_pct": avg_t1,
+        "table2_avg_coverage_pct": avg_t2,
+        "table1_fields": table1,
+        "table2_fields": table2,
+    }
+
+
 # ── 2. Review Fig 5 placements ────────────────────────────────────────────────
 
 class ReviewFig5Request(BaseModel):
