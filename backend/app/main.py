@@ -49,6 +49,7 @@ from .ce_build import (build_ce_table, rebuild_unclear_papers,
                        rebuild_failed_papers, get_rebuild_failed_progress,
                        rebuild_table2_dose, get_rebuild_table2_progress)
 from .table1_corrections import CORRECTIONS as TABLE1_CORRECTIONS, CHECK_FIELDS, UNKNOWN_VALS
+from .table2_corrections import TABLE2_CORRECTIONS, TABLE2_FIELDS, UNKNOWN_VALS as T2_UNKNOWN
 from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
 from .vision import (is_figure_question, get_pages_for_question,
@@ -116,17 +117,75 @@ def _apply_table1_patch() -> Dict[str, Any]:
     return {"updated": updated, "not_found": not_found}
 
 
+def _apply_table2_patch() -> Dict[str, Any]:
+    """Apply Table 2 corrections directly to ce_comparisons. Idempotent."""
+    import unicodedata as _ud
+
+    def _norm(s: str) -> str:
+        return _ud.normalize("NFKD", s.lower()).encode("ascii", "ignore").decode()
+
+    conn = get_conn()
+    try:
+        all_pids = [r[0] for r in conn.execute(
+            "SELECT DISTINCT paper_id FROM ce_comparisons"
+        ).fetchall()]
+    except Exception:
+        conn.close()
+        return {"updated": 0, "not_found": 0}
+
+    norm_pids = {p: _norm(p) for p in all_pids}
+    applied: set = set()
+    updated = 0
+    not_found = 0
+
+    for corr in TABLE2_CORRECTIONS:
+        author_key = _norm(corr["a"].split()[0])
+        year = corr["y"]
+        matches = [
+            p for p, np in norm_pids.items()
+            if author_key in np and year in np and p not in applied
+        ]
+        if len(matches) > 1:
+            strict = [m for m in matches if norm_pids[m].startswith(author_key)]
+            if strict:
+                matches = strict
+        if not matches:
+            not_found += 1
+            continue
+
+        fields = {k: corr[k] for k in TABLE2_FIELDS if k in corr}
+        set_clauses = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values())
+        for pid in matches:
+            conn.execute(
+                f"UPDATE ce_comparisons SET {set_clauses} WHERE paper_id = ?",
+                values + [pid],
+            )
+            applied.add(pid)
+            updated += 1
+
+    conn.commit()
+    conn.close()
+    return {"updated": updated, "not_found": not_found}
+
+
 @app.on_event("startup")
 def _on_startup():
-    # 1. Apply Table 1 patch immediately — inline, no external imports
+    # 1. Apply Table 1 patch
     try:
-        result = _apply_table1_patch()
-        print(f"[STARTUP] Table 1 patch: {result['updated']} papers updated, "
-              f"{result['not_found']} not matched")
+        r1 = _apply_table1_patch()
+        print(f"[STARTUP] Table 1 patch: {r1['updated']} updated, {r1['not_found']} unmatched")
     except Exception as e:
         print(f"[STARTUP] Table 1 patch failed: {e}")
 
-    # 2. Auto-start batch validation in background if no saved report exists
+    # 2. Apply Table 2 patch
+    try:
+        r2 = _apply_table2_patch()
+        print(f"[STARTUP] Table 2 patch: {r2['updated']} updated, {r2['not_found']} unmatched")
+    except Exception as e:
+        print(f"[STARTUP] Table 2 patch failed: {e}")
+
+    # 3. Auto-start batch validation in background if no saved report exists
     if not VALIDATION_REPORT_PATH.exists():
         print("[STARTUP] No validation report — starting background validation…")
         threading.Thread(target=_run_batch_validate, daemon=True).start()
@@ -301,6 +360,13 @@ def patch_table1():
     return {"status": "ok", **result}
 
 
+@app.post("/patch_table2")
+def patch_table2_endpoint():
+    """Apply Table 2 corrections (intervention dose details) from published SR to the DB."""
+    result = _apply_table2_patch()
+    return {"status": "ok", **result}
+
+
 @app.get("/validate_table1")
 def validate_table1():
     """
@@ -393,6 +459,9 @@ def validate_table1():
 
     conn.commit()
     conn.close()
+
+    # Also apply Table 2 patch so coverage numbers are fresh
+    _apply_table2_patch()
 
     total = len(paper_results)
     field_summary = {
