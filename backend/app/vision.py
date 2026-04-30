@@ -65,17 +65,17 @@ def extract_all_figure_refs(question: str) -> List[str]:
 
 
 def extract_all_table_refs(question: str) -> List[str]:
-    """Extract ALL table numbers from the question."""
-    return re.findall(r'\btable\s*(\d+[a-z]?)\b', question, re.IGNORECASE)
+    """Extract ALL table numbers from the question (handles 'table', 'tables', 'Tab.')."""
+    return re.findall(r'\btables?\s*(\d+[a-z]?)\b', question, re.IGNORECASE)
 
 
 def find_table_pages(pdf_path: str, table_num: str) -> List[int]:
-    """Find pages containing a specific table (e.g. '1', '2')."""
+    """Find pages containing a specific table (handles plural, abbreviations, dots)."""
     try:
         doc = fitz.open(pdf_path)
         pages = []
         pattern = re.compile(
-            rf'\btable\s*{re.escape(table_num)}\b',
+            rf'\btables?\.?\s*{re.escape(table_num)}\b',
             re.IGNORECASE,
         )
         for i in range(doc.page_count):
