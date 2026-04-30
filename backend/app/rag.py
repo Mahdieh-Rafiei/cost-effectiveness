@@ -352,9 +352,36 @@ def _build_rag_inputs(
         for h in history[-6:]:   # last 3 exchanges
             if h.get("role") in ("user", "assistant"):
                 messages.append({"role": h["role"], "content": h["content"]})
+    # For the systematic review, always inject per-figure-group DB breakdown
+    db_supplement = ""
+    if _is_review_paper(paper_id):
+        try:
+            from .ce_db import query_sql as _qsql
+            fig_rows = _qsql(
+                "SELECT figure_group, quadrant FROM ce_comparisons "
+                "WHERE quadrant != 'unclear'", ()
+            )
+            fig_quad: Dict[str, Dict[str, int]] = {}
+            for r in fig_rows:
+                fg = r.get("figure_group", "unknown")
+                q  = r.get("quadrant", "unclear")
+                fig_quad.setdefault(fg, {})
+                fig_quad[fg][q] = fig_quad[fg].get(q, 0) + 1
+
+            db_supplement = (
+                "\n\n--- DATABASE: QUADRANT BREAKDOWN BY FIGURE GROUP ---"
+                "\nFig 4 = physiotherapy vs NON-physiotherapy (usual care, surgery, injection, GP)."
+                "\nFig 5 = physiotherapy vs another PHYSIOTHERAPY modality."
+                f"\nFig 4 quadrant counts: {fig_quad.get('Fig4', {})}."
+                f"\nFig 5 quadrant counts: {fig_quad.get('Fig5', {})}."
+                "\nUse these counts to explain differences between Figure 4 and Figure 5."
+            )
+        except Exception:
+            pass
+
     messages.append({
         "role": "user",
-        "content": f"Question:\n{question}\n\nEvidence excerpts:\n{context}",
+        "content": f"Question:\n{question}\n\nEvidence excerpts:\n{context}{db_supplement}",
     })
 
     return {
