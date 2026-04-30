@@ -5,6 +5,7 @@ Single-page conversational UI. No tabs. Just ask questions.
 
 import os
 import re
+import json
 from typing import Optional
 import requests
 import streamlit as st
@@ -142,7 +143,13 @@ def _post(url: str, payload: dict) -> dict:
 
 
 def _stream_ask(payload: dict):
-    """Yield text chunks from /ask_stream."""
+    """
+    Yield (meta, text_chunk) tuples from /ask_stream.
+    First item has meta dict with confidence info; subsequent items have meta=None.
+    """
+    buffer = ""
+    meta_done = False
+    meta = {}
     try:
         with requests.post(
             f"{API_BASE}/ask_stream",
@@ -152,10 +159,25 @@ def _stream_ask(payload: dict):
         ) as r:
             r.raise_for_status()
             for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
-                if chunk:
-                    yield chunk
+                if not chunk:
+                    continue
+                if not meta_done:
+                    buffer += chunk
+                    if "\n---\n" in buffer:
+                        parts = buffer.split("\n---\n", 1)
+                        try:
+                            meta = json.loads(parts[0])
+                        except Exception:
+                            pass
+                        meta_done = True
+                        if parts[1]:
+                            yield meta, parts[1]
+                            meta = None
+                    # else still accumulating meta line
+                else:
+                    yield None, chunk
     except Exception as e:
-        yield f"\n\n⚠️ Stream error: {e}"
+        yield None, f"\n\n⚠️ Stream error: {e}"
 
 
 def _api_ok() -> bool:
@@ -173,10 +195,11 @@ def _load_papers() -> list:
 # ── Session state ─────────────────────────────────────────────────────────────
 
 for _k, _v in [
-    ("messages",     []),
-    ("paper_list",   []),
+    ("messages",       []),
+    ("paper_list",     []),
     ("selected_paper", ""),
-    ("model_list",   []),
+    ("paper_b",        ""),
+    ("model_list",     []),
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -236,17 +259,18 @@ with st.sidebar:
     st.markdown("**⚙️ Query Mode**")
     mode = st.radio(
         "Mode",
-        ["Auto", "Single-paper", "Cross-paper"],
+        ["Auto", "Single-paper", "Cross-paper", "Compare papers"],
         index=0,
         label_visibility="collapsed",
         help=(
             "Auto: routes based on your question\n"
             "Single-paper: ask about one specific paper\n"
-            "Cross-paper: compare across all studies"
+            "Cross-paper: compare across all studies\n"
+            "Compare papers: side-by-side two papers"
         ),
     )
 
-    if mode == "Single-paper":
+    if mode in ("Single-paper", "Compare papers"):
         if not st.session_state.paper_list:
             st.session_state.paper_list = _load_papers()
         papers = st.session_state.paper_list
@@ -261,11 +285,20 @@ with st.sidebar:
             )
             if not filtered:
                 filtered = papers
+
+            label_a = "Paper A" if mode == "Compare papers" else "Paper"
             sp = st.selectbox(
-                "Paper", options=filtered,
+                label_a, options=filtered,
                 label_visibility="collapsed", key="paper_selectbox",
             )
             st.session_state.selected_paper = sp
+
+            if mode == "Compare papers":
+                sp_b = st.selectbox(
+                    "Paper B", options=papers,
+                    label_visibility="visible", key="paper_b_selectbox",
+                )
+                st.session_state.paper_b = sp_b
         else:
             st.warning("No papers found.")
             st.session_state.selected_paper = ""
@@ -339,6 +372,22 @@ with st.sidebar:
                 st.markdown(f'<div class="example-q">💬 {sq}</div>', unsafe_allow_html=True)
 
     st.markdown("---")
+
+    # ── Export chat ───────────────────────────────────────────────────────────
+    if st.session_state.messages:
+        lines = ["# Physio CE — Q&A Export\n"]
+        for m in st.session_state.messages:
+            role = "**You**" if m["role"] == "user" else "**Assistant**"
+            lines.append(f"{role}\n\n{m['content']}\n\n---\n")
+        export_text = "\n".join(lines)
+        st.download_button(
+            label="⬇️ Download chat (MD)",
+            data=export_text,
+            file_name="physio_ce_chat.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
     st.caption("Physio CE Analyser · v2.0")
 
 
@@ -466,20 +515,38 @@ if user_q:
 
     if mode == "Cross-paper":
         use_compare = True
-    elif mode == "Single-paper":
+    elif mode in ("Single-paper", "Compare papers"):
         use_compare = False
     else:
         use_compare = any(k in q_lower for k in CROSS_KW)
 
     with st.chat_message("assistant"):
+        badge_label = (
+            "⚖️ compare papers" if mode == "Compare papers"
+            else ("🔀 cross-paper" if use_compare else f"📄 {active_paper_id or 'all'}")
+        )
         st.markdown(
-            f'<div class="mode-badge">{"🔀" if use_compare else "📄"} '
-            f'{"cross-paper" if use_compare else (active_paper_id or "all")}'
-            f'</div>',
+            f'<div class="mode-badge">{badge_label}</div>',
             unsafe_allow_html=True,
         )
 
-        if use_compare:
+        answer = ""
+
+        if mode == "Compare papers":
+            if not active_paper_id or not st.session_state.paper_b:
+                answer = "Please select both Paper A and Paper B in the sidebar."
+                st.markdown(answer)
+            else:
+                with st.spinner("Comparing papers…"):
+                    data = _post("/compare_papers", {
+                        "paper_id_a": active_paper_id,
+                        "paper_id_b": st.session_state.paper_b,
+                        "question": user_q,
+                    })
+                answer = data.get("answer", "No answer.") if "error" not in data else f"⚠️ {data['error']}"
+                st.markdown(answer)
+
+        elif use_compare:
             with st.spinner("Thinking…"):
                 data = _post("/ask_compare", {"question": user_q})
             answer = (
@@ -487,20 +554,42 @@ if user_q:
                 if "error" not in data else f"⚠️ Error: {data['error']}"
             )
             st.markdown(answer)
+
         else:
-            # Single-paper: show thinking indicator, then stream tokens
+            # Single-paper: stream with confidence indicator
             placeholder = st.empty()
             placeholder.markdown("_Thinking…_")
-            answer = ""
-            for chunk in _stream_ask({
+            conf_placeholder = st.empty()
+            conf_meta = {}
+
+            for meta, chunk in _stream_ask({
                 "question": user_q,
                 "top_k": int(top_k),
                 "paper_id": active_paper_id,
                 "history": history,
             }):
+                if meta:
+                    conf_meta = meta
                 answer += chunk
-                placeholder.markdown(answer + "▌")
+                placeholder.markdown(answer + "◌")
+
             placeholder.markdown(answer)
+
+            if conf_meta:
+                _CONF = {
+                    "high":   ("\U0001f7e2", "#d4edda", "#155724"),
+                    "medium": ("\U0001f7e1", "#fff3cd", "#856404"),
+                    "low":    ("\U0001f534", "#f8d7da", "#721c24"),
+                }
+                lvl = conf_meta.get("confidence", "medium")
+                icon, bg, fg = _CONF.get(lvl, _CONF["medium"])
+                n = conf_meta.get("n_relevant", 0)
+                conf_placeholder.markdown(
+                    f'<div style="background:{bg};color:{fg};padding:3px 10px;'
+                    f'border-radius:6px;font-size:0.74rem;display:inline-block;margin-top:4px">'
+                    f'{icon} Evidence confidence: <b>{lvl}</b> · {n} relevant chunks</div>',
+                    unsafe_allow_html=True,
+                )
 
         st.session_state.messages.append({
             "role": "assistant",

@@ -239,7 +239,21 @@ def _build_rag_inputs(
 
     if not all_hits:
         return {"error": "I could not find relevant excerpts for this question.",
-                "all_hits": [], "intent": intent}
+                "all_hits": [], "intent": intent, "confidence": "low", "n_relevant": 0}
+
+    # Compute confidence from chunk relevance
+    relevant = [h for h in all_hits if h.get("distance", 2.0) < _DISTANCE_THRESHOLD]
+    n_relevant = len(relevant)
+    avg_dist = (
+        sum(h.get("distance", 0.0) for h in relevant[:5]) / min(5, len(relevant))
+        if relevant else 2.0
+    )
+    if n_relevant >= 5 and avg_dist < 0.8:
+        confidence = "high"
+    elif n_relevant >= 2 and avg_dist < 1.3:
+        confidence = "medium"
+    else:
+        confidence = "low"
 
     context = _build_context(all_hits)
     if not context.strip():
@@ -250,7 +264,7 @@ def _build_rag_inputs(
                 "I could not find relevant text for this question in the indexed papers. "
                 "Make sure the paper is ingested and try rephrasing."
             ),
-            "all_hits": all_hits, "intent": intent,
+            "all_hits": all_hits, "intent": intent, "confidence": "low", "n_relevant": 0,
         }
 
     llm = OllamaClient(env_path=env_path)
@@ -324,6 +338,8 @@ def _build_rag_inputs(
                         "all_hits": all_hits,
                         "intent": intent,
                         "chat_model": adaptive_model,
+                        "confidence": confidence,
+                        "n_relevant": n_relevant,
                         "llm": llm,
                     }
                 except Exception as e:
@@ -331,6 +347,7 @@ def _build_rag_inputs(
 
     # Text path — build messages with conversation history
     messages: List[dict] = [{"role": "system", "content": _build_system_prompt(intent)}]
+    # (confidence already computed above)
     if history:
         for h in history[-6:]:   # last 3 exchanges
             if h.get("role") in ("user", "assistant"):
@@ -346,6 +363,8 @@ def _build_rag_inputs(
         "all_hits": all_hits,
         "intent": intent,
         "chat_model": adaptive_model,
+        "confidence": confidence,
+        "n_relevant": n_relevant,
         "llm": llm,
     }
 
@@ -365,7 +384,10 @@ def answer_question(
     result = _build_rag_inputs(question, store, env_path, paper_id, pdf_dir, history)
 
     if "error" in result:
-        return {"answer": result["error"], "sources": [], "intent": result["intent"]}
+        return {"answer": result["error"], "sources": [], "intent": result["intent"],
+                "confidence": "low", "n_relevant": 0}
+
+    conf = {"confidence": result["confidence"], "n_relevant": result["n_relevant"]}
 
     if result.get("vision_answer"):
         return {
@@ -373,6 +395,7 @@ def answer_question(
             "sources": _dedup_sources(result["all_hits"]),
             "intent":  result["intent"],
             "mode":    "vision",
+            **conf,
         }
 
     llm = result["llm"]
@@ -382,6 +405,7 @@ def answer_question(
         "answer":  answer,
         "sources": _dedup_sources(result["all_hits"]),
         "intent":  result["intent"],
+        **conf,
     }
 
 
@@ -394,14 +418,20 @@ def answer_question_stream(
     pdf_dir: Optional[str] = None,
     history: Optional[List[dict]] = None,
 ) -> Generator[str, None, None]:
+    import json as _json
     result = _build_rag_inputs(question, store, env_path, paper_id, pdf_dir, history)
+
+    # First chunk: confidence metadata (parsed by frontend)
+    yield _json.dumps({
+        "confidence": result.get("confidence", "low"),
+        "n_relevant": result.get("n_relevant", 0),
+    }) + "\n---\n"
 
     if "error" in result:
         yield result["error"]
         return
 
     if result.get("vision_answer"):
-        # Vision answers are already complete — yield as one chunk
         yield result["vision_answer"]
         return
 

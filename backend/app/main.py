@@ -80,6 +80,11 @@ class CompareRequest(BaseModel):
     question: str
     body_region: Optional[str] = None  # filter to specific region if given
 
+class ComparePapersRequest(BaseModel):
+    paper_id_a: str
+    paper_id_b: str
+    question: str = "Compare these two studies"
+
 class BodyRegionRequest(BaseModel):
     body_region: str   # e.g. "knee", "shoulder", "low_back"
 
@@ -248,6 +253,51 @@ def paper_info(paper_id: str):
         "ce_conclusion":    conclusions[0] if len(set(conclusions)) == 1 else conclusions,
         "num_comparisons":  len(rows),
     }
+
+
+@app.post("/compare_papers")
+def compare_papers(req: ComparePapersRequest):
+    """Side-by-side structured comparison of two papers."""
+    llm = OllamaClient(env_path=ENV_PATH)
+
+    def _paper_summary(pid: str) -> str:
+        rows = query_sql("SELECT * FROM ce_comparisons WHERE paper_id = ?", (pid,))
+        chunks = store.query(req.question, k=6, where={"paper_id": pid})
+        text = "\n".join(f"[p.{h['meta']['page']}] {h['text']}" for h in chunks)
+        db = ""
+        if rows:
+            r = rows[0]
+            db = (
+                f"Body region: {r.get('body_region','unknown')} | "
+                f"Intervention: {r.get('intervention_type','unknown')} | "
+                f"Comparator: {r.get('comparator_type','unknown')} | "
+                f"ICER: {r.get('icer','unknown')} | "
+                f"Quadrant: {r.get('quadrant','unclear')} | "
+                f"CE conclusion: {r.get('ce_conclusion','inconclusive')} | "
+                f"Time horizon: {r.get('time_horizon','unknown')} | "
+                f"Perspective: {r.get('perspective','unknown')} | "
+                f"Outcome: {r.get('outcome_measure','unknown')}"
+            )
+        return f"=== {pid} ===\nDatabase: {db}\n\nText excerpts:\n{text}"
+
+    summary_a = _paper_summary(req.paper_id_a)
+    summary_b = _paper_summary(req.paper_id_b)
+
+    messages = [
+        {"role": "system", "content": (
+            "You are a health economics expert comparing two physiotherapy cost-effectiveness studies. "
+            "Produce a structured side-by-side comparison as a markdown table followed by a narrative summary. "
+            "Cover: study design, body region, intervention, comparator, ICER, quadrant, CE conclusion, time horizon, perspective, outcome measure. "
+            "Be concise and factual. Use 'not reported' when data is missing."
+        )},
+        {"role": "user", "content": (
+            f"Question: {req.question}\n\n"
+            f"{summary_a}\n\n{summary_b}\n\n"
+            "Produce: 1) A markdown comparison table, 2) A brief narrative (3-5 sentences) answering the question."
+        )},
+    ]
+    answer = llm.chat(messages, temperature=0.1, model=_chat_model, timeout=180)
+    return {"answer": answer, "paper_a": req.paper_id_a, "paper_b": req.paper_id_b}
 
 
 @app.get("/list_papers")
