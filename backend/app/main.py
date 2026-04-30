@@ -46,6 +46,7 @@ from .chunking import make_chunks
 from .vectorstore import VectorStore
 from .rag import answer_question, answer_question_stream
 from .ce_build import build_ce_table, rebuild_unclear_papers, rebuild_failed_papers, get_rebuild_failed_progress
+from .table1_corrections import CORRECTIONS as TABLE1_CORRECTIONS, CHECK_FIELDS, UNKNOWN_VALS
 from .ce_db import query_sql, init_db, get_comparisons_summary
 from .ollama_client import OllamaClient
 from .vision import (is_figure_question, get_pages_for_question,
@@ -62,16 +63,64 @@ app = FastAPI(title="Cost-Effectiveness Physiotherapy RAG")
 store = VectorStore(persist_dir=str(CHROMA_DIR), env_path=ENV_PATH, collection_name="papers")
 
 
+def _apply_table1_patch() -> Dict[str, Any]:
+    """
+    Apply Table 1 corrections directly to ce_comparisons.
+    Uses the imported TABLE1_CORRECTIONS — no external file imports.
+    Idempotent: safe to run on every startup.
+    """
+    conn = get_conn()
+    try:
+        all_pids = [r[0] for r in conn.execute(
+            "SELECT DISTINCT paper_id FROM ce_comparisons"
+        ).fetchall()]
+    except Exception:
+        conn.close()
+        return {"updated": 0, "not_found": 0}
+
+    update_fields = ["body_region", "condition", "country", "study_design",
+                     "perspective", "outcome_measure", "outcome_type", "time_horizon"]
+    applied: set = set()
+    updated = 0
+    not_found = 0
+
+    for corr in TABLE1_CORRECTIONS:
+        author_key = corr["a"].lower().split()[0]
+        year = corr["y"]
+        matches = [
+            p for p in all_pids
+            if author_key in p.lower() and year in p and p not in applied
+        ]
+        if len(matches) > 1:
+            strict = [m for m in matches if m.lower().startswith(author_key)]
+            if strict:
+                matches = strict
+        if not matches:
+            not_found += 1
+            continue
+        fields = {k: corr[k] for k in update_fields if k in corr}
+        set_clauses = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values())
+        for pid in matches:
+            conn.execute(
+                f"UPDATE ce_comparisons SET {set_clauses} WHERE paper_id = ?",
+                values + [pid],
+            )
+            applied.add(pid)
+            updated += 1
+
+    conn.commit()
+    conn.close()
+    return {"updated": updated, "not_found": not_found}
+
+
 @app.on_event("startup")
 def _on_startup():
-    # 1. Apply Table 1 patch immediately (idempotent SQL UPDATEs)
+    # 1. Apply Table 1 patch immediately — inline, no external imports
     try:
-        import sys as _sys
-        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from patch_from_table1 import patch as _patch
-        result = _patch(db_path=str(DATA_DIR / "ce_studies.sqlite3"))
-        print(f"[STARTUP] Table 1 patch applied: {result['updated']} papers updated, "
-              f"{result['not_found']} not found")
+        result = _apply_table1_patch()
+        print(f"[STARTUP] Table 1 patch: {result['updated']} papers updated, "
+              f"{result['not_found']} not matched")
     except Exception as e:
         print(f"[STARTUP] Table 1 patch failed: {e}")
 
@@ -80,7 +129,7 @@ def _on_startup():
         print("[STARTUP] No validation report — starting background validation…")
         threading.Thread(target=_run_batch_validate, daemon=True).start()
     else:
-        print("[STARTUP] Validation report already exists — ready to answer instantly.")
+        print("[STARTUP] Validation report exists — ready to answer instantly.")
 
 # ── Global model state (changed at runtime via /set_model) ────────────────────
 from dotenv import load_dotenv
@@ -245,17 +294,93 @@ def rebuild_unclear():
 
 @app.post("/patch_table1")
 def patch_table1():
-    """
-    Directly import Table 1 data from the published systematic review into
-    the database. Fixes body_region, country, study_design, perspective,
-    outcome_measure, outcome_type, time_horizon for all 78 papers.
-    Much more reliable than LLM extraction for these fields.
-    """
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from patch_from_table1 import patch as _patch
-    result = _patch(db_path=str(DATA_DIR / "ce_studies.sqlite3"))
+    """Apply Table 1 corrections from published SR directly to the DB."""
+    result = _apply_table1_patch()
     return {"status": "ok", **result}
+
+
+@app.get("/validate_table1")
+def validate_table1():
+    """
+    Compare DB extracted values field-by-field against Table 1 ground truth
+    from the published systematic review. Returns exact correct/incorrect/missing
+    status per paper per field — no LLM, no caching, always fresh.
+    """
+    conn = get_conn()
+    all_pids = [r[0] for r in conn.execute(
+        "SELECT DISTINCT paper_id FROM ce_comparisons"
+    ).fetchall()]
+
+    paper_results = []
+    applied: set = set()
+
+    for corr in TABLE1_CORRECTIONS:
+        author_key = corr["a"].lower().split()[0]
+        year = corr["y"]
+        matches = [
+            p for p in all_pids
+            if author_key in p.lower() and year in p and p not in applied
+        ]
+        if len(matches) > 1:
+            strict = [m for m in matches if m.lower().startswith(author_key)]
+            if strict:
+                matches = strict
+        if not matches:
+            continue
+        pid = matches[0]
+        applied.add(pid)
+
+        row = conn.execute(
+            "SELECT * FROM ce_comparisons WHERE paper_id = ? LIMIT 1", (pid,)
+        ).fetchone()
+        if not row:
+            continue
+
+        field_results = {}
+        for field in CHECK_FIELDS:
+            db_val = str(row[field] or "").strip()
+            correct_val = str(corr.get(field, "")).strip()
+            db_lower = db_val.lower()
+            if db_lower in UNKNOWN_VALS or db_val == "":
+                status = "missing"
+            elif db_lower == correct_val.lower():
+                status = "correct"
+            else:
+                status = "incorrect"
+            field_results[field] = {
+                "db": db_val if db_val else "—",
+                "correct": correct_val,
+                "status": status,
+            }
+
+        counts = {s: sum(1 for f in field_results.values() if f["status"] == s)
+                  for s in ("correct", "incorrect", "missing")}
+        paper_results.append({
+            "paper_id": pid,
+            "fields": field_results,
+            "counts": counts,
+        })
+
+    conn.close()
+
+    total = len(paper_results)
+    field_summary = {}
+    for field in CHECK_FIELDS:
+        field_summary[field] = {s: sum(
+            1 for p in paper_results
+            if p["fields"].get(field, {}).get("status") == s
+        ) for s in ("correct", "incorrect", "missing")}
+
+    overall_correct = sum(p["counts"]["correct"] for p in paper_results)
+    overall_total   = total * len(CHECK_FIELDS)
+
+    return {
+        "total_papers_checked": total,
+        "total_fields": overall_total,
+        "overall_correct_pct": round(overall_correct / max(overall_total, 1) * 100),
+        "field_summary": field_summary,
+        "paper_results": paper_results,
+    }
 
 
 @app.post("/rebuild_failed")

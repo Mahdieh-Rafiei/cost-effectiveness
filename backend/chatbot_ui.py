@@ -598,75 +598,60 @@ if user_q:
 
         if _is_validate and active_paper_id and not use_compare:
             if _is_review_selected:
-                # Instant database coverage check
-                qv = _get("/quick_validate")
-                t1 = qv.get("table1_fields", {})
-                t2 = qv.get("table2_fields", {})
-                total = qv.get("total_papers", 0)
-                avg1 = qv.get("table1_avg_coverage_pct", 0)
-                avg2 = qv.get("table2_avg_coverage_pct", 0)
+                # Direct comparison of DB values vs Table 1 ground truth
+                with st.spinner("Checking each paper against Table 1…"):
+                    vt1 = _get("/validate_table1")
 
-                def _bar(pct):
-                    filled = round(pct / 10)
-                    return "█" * filled + "░" * (10 - filled) + f" {pct}%"
-
-                t1_rows = "\n".join(
-                    f"| {k.replace('_',' ').title()} | {_bar(v['pct'])} | {v['extracted']}/{total} |"
-                    for k, v in t1.items()
-                )
-                t2_rows = "\n".join(
-                    f"| {k.replace('_',' ').title()} | {_bar(v['pct'])} | {v['extracted']}/{total} |"
-                    for k, v in t2.items()
-                )
-
-                answer = (
-                    f"**Extraction coverage across {total} individual papers:**\n\n"
-                    f"**Table 1 — Study characteristics** (avg: {avg1}%)\n"
-                    f"| Field | Coverage | Extracted |\n|---|---|---|\n{t1_rows}\n\n"
-                    f"**Table 2 — Intervention details** (avg: {avg2}%)\n"
-                    f"| Field | Coverage | Extracted |\n|---|---|---|\n{t2_rows}\n\n"
-                )
-
-                # Add re-extraction progress if running
-                rebuild_status = _get("/rebuild_failed_status")
-                if rebuild_status.get("running"):
-                    rb_done = rebuild_status.get("done", 0)
-                    rb_total = rebuild_status.get("total", 0)
-                    answer += f"\n\n_Re-extraction in progress: {rb_done}/{rb_total} papers fixed…_"
-
-                # Add LLM validation status
-                status = _get("/batch_validate_status")
-                report = _get("/batch_validate_report")
-
-                if status.get("running"):
-                    done = status.get("done", 0)
-                    tot = status.get("total", 0)
-                    answer += f"_Deep accuracy check running: {done}/{tot} papers validated…_"
-                elif "error" not in report:
-                    results = report.get("results", [])
-                    summary = report.get("summary", {})
-                    report_note = report.get("note", "")
-                    issues_list = [
-                        f"- **{r.get('author','')} {r.get('year','')}**: {r['issues'][0]}"
-                        for r in results if r.get("issues")
-                    ]
-                    answer += (
-                        f"**Deep accuracy check** ({len(results)} papers):\n"
-                        + " · ".join(f"{k}: {v}" for k, v in summary.items())
-                        + (f"\n\nTop issues:\n" + "\n".join(issues_list[:10]) if issues_list else "")
-                        + "\n\n_Note: The Table 1 fields (body region, country, perspective, etc.) "
-                        "have been patched from the published systematic review — these are now "
-                        "correct. The accuracy check above reflects the state BEFORE the patch. "
-                        "Ask: **'Run deep validation of all papers'** to re-run it on the corrected data._"
-                    )
+                if "error" in vt1:
+                    answer = f"⚠️ {vt1['error']}"
+                    st.markdown(answer)
                 else:
-                    answer += (
-                        "_Table 1 fields (body region, country, study design, perspective, "
-                        "outcome measure, time horizon) are now patched from the published SR — "
-                        "these are authoritative.\n\n"
-                        "For a full accuracy check of all 78 papers, ask: "
-                        "**'Run deep validation of all papers'**_"
+                    total = vt1.get("total_papers_checked", 0)
+                    pct = vt1.get("overall_correct_pct", 0)
+                    fs = vt1.get("field_summary", {})
+                    paper_results = vt1.get("paper_results", [])
+
+                    def _bar(n, total_papers):
+                        p = round(n / max(total_papers, 1) * 100)
+                        filled = round(p / 10)
+                        return "█" * filled + "░" * (10 - filled) + f" {p}% ({n}/{total_papers})"
+
+                    field_rows = "\n".join(
+                        f"| {k.replace('_',' ').title()} "
+                        f"| {_bar(v['correct'], total)} "
+                        f"| {v['incorrect']} wrong "
+                        f"| {v['missing']} missing |"
+                        for k, v in fs.items()
                     )
+
+                    # Papers with incorrect values
+                    incorrect_papers = [
+                        p for p in paper_results if p["counts"]["incorrect"] > 0
+                    ]
+                    missing_papers = [
+                        p for p in paper_results
+                        if p["counts"]["incorrect"] == 0 and p["counts"]["missing"] > 0
+                    ]
+
+                    wrong_lines = []
+                    for p in incorrect_papers[:15]:
+                        pid = p["paper_id"].split("-")[0]  # just author name
+                        wrongs = [
+                            f"{f}: **{d['db']}** → should be **{d['correct']}**"
+                            for f, d in p["fields"].items() if d["status"] == "incorrect"
+                        ]
+                        wrong_lines.append(f"- **{pid}**: {'; '.join(wrongs)}")
+
+                    answer = (
+                        f"**Table 1 extraction quality — {total} papers checked against published SR**\n\n"
+                        f"Overall correctness: **{pct}%**\n\n"
+                        f"| Field | Correct | Wrong | Missing |\n|---|---|---|---|\n{field_rows}\n\n"
+                    )
+                    if wrong_lines:
+                        answer += f"**Papers with incorrect values ({len(incorrect_papers)}):**\n" + "\n".join(wrong_lines) + "\n\n"
+                    if missing_papers:
+                        answer += f"**{len(missing_papers)} papers** still have missing fields (shown as '—'). "
+                        answer += "These were not matched to Table 1 — their PDFs may have non-standard naming."
 
                 st.markdown(answer)
 
